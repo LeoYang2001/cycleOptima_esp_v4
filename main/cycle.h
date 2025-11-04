@@ -18,14 +18,31 @@
 #define FLOW_SENSOR_PIN      GPIO_NUM_0
 #define NUM_COMPONENTS       8
 
-// ------------------------- DATA STRUCTS -------------------------
+// -------------------- MOTOR TYPES --------------------
+// one entry in "pattern": { stepTime, pauseTime, direction }
+typedef struct {
+    uint32_t step_time_ms;    // "stepTime"
+    uint32_t pause_time_ms;   // "pauseTime"
+    const char *direction;    // "cw" or "ccw"
+} MotorPatternStep;
+
+// the full motorConfig block
+typedef struct {
+    int repeat_times;               // "repeatTimes"
+    MotorPatternStep *pattern;      // array of steps
+    size_t pattern_len;             // number of steps
+    const char *running_style;      // optional, e.g. "Single Direction"
+} MotorConfig;
+
+// -------------------- PHASE TYPES --------------------
 typedef struct {
     const char *id;
     const char *label;
-    const char *compId;      // e.g. "Retractor", "Cold Valve"
+    const char *compId;
     uint32_t    start_ms;
     uint32_t    duration_ms;
-    bool        has_motor;
+    bool        has_motor;          // false for normal components
+    MotorConfig *motor_cfg;         // NULL for normal components
 } PhaseComponent;
 
 typedef struct {
@@ -46,19 +63,24 @@ typedef struct {
     uint64_t    fire_time_us;
     EventType   type;
     gpio_num_t  pin;
-    
+        int         level;     // for motor direction
 } TimelineEvent;
 
+
+
+esp_err_t load_cycle_from_json_str(const char *json_str,
+                                   Phase *phases,
+                                   size_t max_phases,
+                                   PhaseComponent *components_pool,
+                                   size_t max_components_per_phase,
+                                   size_t *out_num_phases);
 // ------------------------- API -------------------------
 void init_all_gpio(void);
-size_t build_timeline_from_phase(const Phase *phase,
-                                 TimelineEvent *out_events,
-                                 size_t max_events);
-void run_phase_with_esp_timer(const Phase *phase);
-
 void start_gpio_monitor(void);
 void stop_gpio_monitor(void);
-
-
-
+void run_phase_with_esp_timer(const Phase *phase);
 void run_cycle(Phase *phases, size_t num_phases);
+void cycle_skip_current_phase(bool force_off_all);
+
+
+

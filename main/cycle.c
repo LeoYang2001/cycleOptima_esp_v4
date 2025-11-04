@@ -8,7 +8,20 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "fs.h"
+#include "cJSON.h"
+
 static const char *TAG = "cycle";
+
+
+// how many motor-config-bearing components we can handle
+#define MAX_MOTOR_CONFIGS  32
+#define MAX_MOTOR_STEPS    128
+
+static MotorConfig     g_motor_cfg_pool[MAX_MOTOR_CONFIGS];
+static MotorPatternStep g_motor_steps_pool[MAX_MOTOR_STEPS];
+static size_t g_motor_cfg_used  = 0;
+static size_t g_motor_steps_used = 0;
 
 //GLOBAL VARIABLE
 static uint64_t phase_start_us = 0;
@@ -59,6 +72,137 @@ static void gpio_monitor_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+esp_err_t load_cycle_from_json_str(const char *json_str,
+                                   Phase *phases,
+                                   size_t max_phases,
+                                   PhaseComponent *components_pool,
+                                   size_t max_components_per_phase,
+                                   size_t *out_num_phases)
+{
+    cJSON *root = cJSON_Parse(json_str);
+    if (!root) {
+        ESP_LOGE(TAG, "JSON parse error");
+        return ESP_FAIL;
+    }
+
+    cJSON *phases_arr = cJSON_GetObjectItem(root, "phases");
+    if (!cJSON_IsArray(phases_arr)) {
+        ESP_LOGE(TAG, "'phases' is missing or not an array");
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+
+    size_t num_phases = cJSON_GetArraySize(phases_arr);
+    if (num_phases > max_phases) {
+        num_phases = max_phases;
+    }
+
+    for (size_t pi = 0; pi < num_phases; pi++) {
+        cJSON *pjson = cJSON_GetArrayItem(phases_arr, pi);
+        Phase *p = &phases[pi];
+
+        cJSON *id        = cJSON_GetObjectItem(pjson, "id");
+        cJSON *name      = cJSON_GetObjectItem(pjson, "name");
+        cJSON *color     = cJSON_GetObjectItem(pjson, "color");
+        cJSON *startTime = cJSON_GetObjectItem(pjson, "startTime");
+        cJSON *components= cJSON_GetObjectItem(pjson, "components");
+
+        p->id   = id   ? id->valuestring   : NULL;
+        p->name = name ? name->valuestring : NULL;
+        p->color= color? color->valuestring: NULL;
+        p->start_time_ms = startTime ? (uint32_t)startTime->valueint : 0;
+
+        size_t comp_count = cJSON_IsArray(components) ? cJSON_GetArraySize(components) : 0;
+        if (comp_count > max_components_per_phase) {
+            comp_count = max_components_per_phase;
+        }
+
+        PhaseComponent *phase_comps = &components_pool[pi * max_components_per_phase];
+        p->components = phase_comps;
+        p->num_components = comp_count;
+
+        for (size_t ci = 0; ci < comp_count; ci++) {
+            cJSON *cjson = cJSON_GetArrayItem(components, ci);
+            PhaseComponent *c = &phase_comps[ci];
+
+            cJSON *cid      = cJSON_GetObjectItem(cjson, "id");
+            cJSON *label    = cJSON_GetObjectItem(cjson, "label");
+            cJSON *start    = cJSON_GetObjectItem(cjson, "start");
+            cJSON *compId   = cJSON_GetObjectItem(cjson, "compId");
+            cJSON *duration = cJSON_GetObjectItem(cjson, "duration");
+            cJSON *motorCfg = cJSON_GetObjectItem(cjson, "motorConfig");
+
+            c->id          = cid      ? cid->valuestring      : NULL;
+            c->label       = label    ? label->valuestring    : NULL;
+            c->compId      = compId   ? compId->valuestring   : NULL;
+            c->start_ms    = start    ? (uint32_t)start->valueint    : 0;
+            c->duration_ms = duration ? (uint32_t)duration->valueint : 0;
+            c->has_motor   = false;
+            c->motor_cfg   = NULL;
+
+            // optional motorConfig
+           if (motorCfg && !cJSON_IsNull(motorCfg)) {
+                // make sure we have room
+                if (g_motor_cfg_used < MAX_MOTOR_CONFIGS) {
+                    MotorConfig *mc = &g_motor_cfg_pool[g_motor_cfg_used++];
+                    memset(mc, 0, sizeof(MotorConfig));
+
+                    // repeatTimes
+                    cJSON *repeatTimes  = cJSON_GetObjectItem(motorCfg, "repeatTimes");
+                    mc->repeat_times = repeatTimes ? repeatTimes->valueint : 1;
+
+                    // runningStyle (optional)
+                    cJSON *runningStyle = cJSON_GetObjectItem(motorCfg, "runningStyle");
+                    mc->running_style = runningStyle ? runningStyle->valuestring : NULL;
+
+                    // pattern array
+                    cJSON *pattern = cJSON_GetObjectItem(motorCfg, "pattern");
+                    if (pattern && cJSON_IsArray(pattern)) {
+                        int pattern_len = cJSON_GetArraySize(pattern);
+                        if (pattern_len > 0) {
+                            // remember where this motor's steps start in the global steps pool
+                            size_t steps_start = g_motor_steps_used;
+                            for (int si = 0; si < pattern_len; si++) {
+                                if (g_motor_steps_used >= MAX_MOTOR_STEPS) {
+                                    break;
+                                }
+                                cJSON *step_json = cJSON_GetArrayItem(pattern, si);
+                                MotorPatternStep *step = &g_motor_steps_pool[g_motor_steps_used++];
+
+                                cJSON *stepTime  = cJSON_GetObjectItem(step_json, "stepTime");
+                                cJSON *pauseTime = cJSON_GetObjectItem(step_json, "pauseTime");
+                                cJSON *direction = cJSON_GetObjectItem(step_json, "direction");
+
+                                step->step_time_ms  = stepTime  ? (uint32_t)stepTime->valueint  : 1000;
+                                step->pause_time_ms = pauseTime ? (uint32_t)pauseTime->valueint : 0;
+                                step->direction     = direction ? direction->valuestring        : "cw";
+                            }
+
+                            // now point the motor config to its slice of steps
+                            mc->pattern     = &g_motor_steps_pool[steps_start];
+                            mc->pattern_len = g_motor_steps_used - steps_start;
+                        }
+                    }
+
+                    // finally hook this component to this motor config
+                    c->has_motor = true;
+                    c->motor_cfg = mc;
+                } else {
+                    ESP_LOGW(TAG, "motorConfig present but motor cfg pool is full");
+                }
+            }
+        }
+    }
+
+    *out_num_phases = num_phases;
+
+    // NOTE: we didn't free root because we are borrowing strings
+    // for quick prototyping that's fine
+
+    return ESP_OK;
+}
+
+
 void start_gpio_monitor(void)
 {
     if (monitor_task_handle) return;  // already running
@@ -104,7 +248,7 @@ static const ComponentPinMap COMPONENT_PIN_MAP[] = {
     { "Drain Pump",       DRAIN_PUMP_PIN },
     { "Hot Valve",        HOT_VALVE_PIN },
     { "Soft Valve",       SOFT_VALVE_PIN },
-    { "Motor On",         MOTOR_ON_PIN },
+    { "Motor",         MOTOR_ON_PIN },
     { "Motor Direction",  MOTOR_DIRECTION_PIN }
 };
 
@@ -121,6 +265,67 @@ static gpio_num_t resolve_pin(const char *compId)
     return GPIO_NUM_NC;
 }
 
+// Expand a motor component into timeline events.
+// Returns how many events were written into out_events.
+static size_t append_motor_events(const PhaseComponent *c,
+                                  uint32_t phase_base_ms,
+                                  TimelineEvent *out_events,
+                                  size_t max_events)
+{
+    if (!c->motor_cfg) return 0;
+
+    MotorConfig *mc = c->motor_cfg;
+    size_t written = 0;
+    uint32_t t_ms = c->start_ms;  // time offset inside this phase
+
+    for (int r = 0; r < mc->repeat_times; r++) {
+        for (size_t p = 0; p < mc->pattern_len; p++) {
+            MotorPatternStep *step = &mc->pattern[p];
+
+            // 1) set direction for this step
+            if (written < max_events) {
+                int dir_level = 0; // default: cw = 0
+                if (step->direction && strcmp(step->direction, "ccw") == 0) {
+                    dir_level = 1;
+                }
+
+                out_events[written].fire_time_us =
+                    (uint64_t)(phase_base_ms + t_ms) * 1000ULL;
+                out_events[written].type  = EVENT_ON;
+                out_events[written].pin   = MOTOR_DIRECTION_PIN;
+                out_events[written].level = dir_level;
+                written++;
+            }
+
+            // 2) motor ON (active-low → 0)
+            if (written < max_events) {
+                out_events[written].fire_time_us =
+                    (uint64_t)(phase_base_ms + t_ms) * 1000ULL;
+                out_events[written].type  = EVENT_ON;
+                out_events[written].pin   = MOTOR_ON_PIN;
+                out_events[written].level = 0;
+                written++;
+            }
+
+            // 3) motor OFF after stepTime
+            if (written < max_events) {
+                uint32_t off_ms = t_ms + step->step_time_ms;
+                out_events[written].fire_time_us =
+                    (uint64_t)(phase_base_ms + off_ms) * 1000ULL;
+                out_events[written].type  = EVENT_OFF;
+                out_events[written].pin   = MOTOR_ON_PIN;
+                out_events[written].level = 1;    // active-low OFF
+                written++;
+            }
+
+            // 4) advance time by step + pause
+            t_ms += step->step_time_ms + step->pause_time_ms;
+        }
+    }
+
+    return written;
+}
+
 // ------------------------- TIMELINE BUILDER -------------------------
 size_t build_timeline_from_phase(const Phase *phase,
                                  TimelineEvent *out_events,
@@ -128,48 +333,64 @@ size_t build_timeline_from_phase(const Phase *phase,
 {
     size_t idx = 0;
 
-    for (size_t i = 0; i < phase->num_components; i++) {
+    for (size_t i = 0; i < phase->num_components && idx < max_events; i++) {
         const PhaseComponent *c = &phase->components[i];
+
+        // motor branch
+        if (c->has_motor && c->motor_cfg != NULL) {
+            size_t added = append_motor_events(
+                c,
+                phase->start_time_ms,
+                &out_events[idx],
+                max_events - idx
+            );
+            idx += added;
+            continue;
+        }
+
+        // normal component branch
         gpio_num_t pin = resolve_pin(c->compId);
         if (pin == GPIO_NUM_NC) {
             ESP_LOGW(TAG, "Unknown compId: %s", c->compId);
             continue;
         }
 
-        // ON event
+        // ON
         if (idx < max_events) {
-            out_events[idx].fire_time_us = (uint64_t)(phase->start_time_ms + c->start_ms) * 1000ULL;
-            out_events[idx].type         = EVENT_ON;
-            out_events[idx].pin          = pin;
+            out_events[idx].fire_time_us =
+                (uint64_t)(phase->start_time_ms + c->start_ms) * 1000ULL;
+            out_events[idx].type  = EVENT_ON;
+            out_events[idx].pin   = pin;
+            out_events[idx].level = 0;      // active-low ON
             idx++;
         }
 
-        // OFF event
+        // OFF
         if (idx < max_events) {
             uint32_t off_ms = phase->start_time_ms + c->start_ms + c->duration_ms;
-            out_events[idx].fire_time_us = (uint64_t)off_ms * 1000ULL;
-            out_events[idx].type         = EVENT_OFF;
-            out_events[idx].pin          = pin;
+            out_events[idx].fire_time_us =
+                (uint64_t)off_ms * 1000ULL;
+            out_events[idx].type  = EVENT_OFF;
+            out_events[idx].pin   = pin;
+            out_events[idx].level = 1;      // active-low OFF
             idx++;
         }
     }
 
     return idx;
 }
-
 // ------------------------- TIMER CALLBACK -------------------------
 static void event_timer_cb(void *arg)
 {
     TimelineEvent *ev = (TimelineEvent *)arg;
     if (ev->pin == GPIO_NUM_NC) return;
 
-    int level_to_set = (ev->type == EVENT_ON) ? 0 : 1;  // active-low
-    gpio_set_level(ev->pin, level_to_set);
+    gpio_set_level(ev->pin, ev->level);
 
     // update shadow
-    for (int i = 0; i < NUM_COMPONENTS; i++) {
+     for (int i = 0; i < NUM_COMPONENTS; i++) {
         if (all_pins[i] == ev->pin) {
-            gpio_shadow[i] = level_to_set;
+            gpio_shadow[i] = ev->level;
             break;
         }
     }
@@ -195,6 +416,7 @@ void run_phase_with_esp_timer(const Phase *phase)
 
     //set current phase name
       current_phase_name = phase->name ? phase->name : "Unknown"; 
+      
       
     // build timeline into context
     size_t n = build_timeline_from_phase(phase,
@@ -296,3 +518,4 @@ void run_cycle(Phase *phases, size_t num_phases)
     cycle_running = false;  // stop the monitor loop
     stop_gpio_monitor();
 }
+
