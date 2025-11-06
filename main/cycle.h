@@ -74,13 +74,22 @@ esp_err_t load_cycle_from_json_str(const char *json_str,
                                    PhaseComponent *components_pool,
                                    size_t max_components_per_phase,
                                    size_t *out_num_phases);
-// ------------------------- API -------------------------
+
+
+
+ // STATE MACHINE FUNCTIONS
+esp_err_t cycle_load_from_json_str(const char *json_str);
+void cycle_run_loaded_cycle(void);
 void init_all_gpio(void);
+void cycle_skip_current_phase(bool force_off_all);
+bool cycle_is_running(void);
+
+
+// ------------------------- API -------------------------
 void start_gpio_monitor(void);
 void stop_gpio_monitor(void);
 void run_phase_with_esp_timer(const Phase *phase);
 void run_cycle(Phase *phases, size_t num_phases);
-void cycle_skip_current_phase(bool force_off_all);
 
 
 

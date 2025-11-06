@@ -17,6 +17,8 @@ static const char *TAG = "cycle";
 // how many motor-config-bearing components we can handle
 #define MAX_MOTOR_CONFIGS  32
 #define MAX_MOTOR_STEPS    128
+#define MAX_PHASES         16
+#define MAX_COMPONENTS_PER_PHASE 16
 
 static MotorConfig     g_motor_cfg_pool[MAX_MOTOR_CONFIGS];
 static MotorPatternStep g_motor_steps_pool[MAX_MOTOR_STEPS];
@@ -28,6 +30,11 @@ static uint64_t phase_start_us = 0;
 static bool cycle_running = false;
 static TaskHandle_t monitor_task_handle = NULL;
 static const char *current_phase_name = "N/A";
+
+// Global state for loaded cycle (for cycle_load_from_json_str + cycle_run_loaded_cycle)
+static Phase g_phases[MAX_PHASES];
+static PhaseComponent g_components_pool[MAX_PHASES * MAX_COMPONENTS_PER_PHASE];
+static size_t g_num_phases = 0;
 
 // ------------------ PIN + SHADOW ------------------
 static int gpio_shadow[NUM_COMPONENTS];
@@ -469,6 +476,11 @@ void run_phase_with_esp_timer(const Phase *phase)
 // PUBLIC: skip/cancel current phase
 // this can be called from a sensor task when condition is met
 // ------------------------------------------------------------
+bool cycle_is_running(void)
+{
+    return cycle_running;
+}
+
 void cycle_skip_current_phase(bool force_off_all)
 {
     if (!g_phase_ctx.active) {
@@ -493,6 +505,7 @@ void cycle_skip_current_phase(bool force_off_all)
     }
 
     g_phase_ctx.active = false;
+    cycle_running = false;
     ESP_LOGW(TAG, "Current phase skipped/cancelled.");
 }
 
@@ -519,3 +532,66 @@ void run_cycle(Phase *phases, size_t num_phases)
     stop_gpio_monitor();
 }
 
+
+
+esp_err_t cycle_load_from_json_str(const char *json_str)
+{
+    if (!json_str) {
+        ESP_LOGE(TAG, "cycle_load_from_json_str: null json_str");
+        return ESP_FAIL;
+    }
+
+    // reset motor pools and phase count
+    g_motor_cfg_used = 0;
+    g_motor_steps_used = 0;
+    g_num_phases = 0;
+    memset(g_phases, 0, sizeof(g_phases));
+    memset(g_components_pool, 0, sizeof(g_components_pool));
+
+    // Use existing parser
+    esp_err_t ret = load_cycle_from_json_str(
+        json_str,
+        g_phases,
+        MAX_PHASES,
+        g_components_pool,
+        MAX_COMPONENTS_PER_PHASE,
+        &g_num_phases
+    );
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Loaded %zu phases into RAM (IDLE)", g_num_phases);
+    } else {
+        ESP_LOGE(TAG, "Failed to load cycle from JSON");
+    }
+
+    return ret;
+}
+
+
+// Task to run the cycle in the background (non-blocking)
+static void cycle_task(void *pvParameter)
+{
+    run_cycle(g_phases, g_num_phases);
+    vTaskDelete(NULL);
+}
+
+void cycle_run_loaded_cycle(void)
+{
+    if (g_num_phases == 0) {
+        ESP_LOGW(TAG, "cycle_run_loaded_cycle: no cycle loaded");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Running loaded cycle (%zu phases) in background task", g_num_phases);
+    
+    // Create a background task to run the cycle so WebSocket stays responsive
+    xTaskCreatePinnedToCore(
+        cycle_task,           // task function
+        "cycle_runner",       // task name
+        4096,                 // stack size
+        NULL,                 // parameter
+        5,                    // priority (above normal)
+        NULL,                 // task handle (not needed for cleanup)
+        0                     // core 0
+    );
+}

@@ -1,5 +1,6 @@
 // wifi_sta.c
 #include "wifi_sta.h"
+#include "ws_cycle.h"  // for ws_cycle_get_port()
 
 #include <string.h>
 #include "esp_wifi.h"
@@ -40,6 +41,15 @@ static void wifi_event_handler(void *arg,
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         s_connected = true;
+
+        // Log WebSocket endpoint with the actual IP
+        uint16_t ws_port = ws_cycle_get_port();
+        if (ws_port > 0) {
+            ESP_LOGI(TAG, "====================================================");
+            ESP_LOGI(TAG, "WebSocket endpoint ready:");
+            ESP_LOGI(TAG, "  ws://" IPSTR ":%d/ws", IP2STR(&event->ip_info.ip), ws_port);
+            ESP_LOGI(TAG, "====================================================");
+        }
     }
 }
 

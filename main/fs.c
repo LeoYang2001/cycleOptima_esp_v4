@@ -57,3 +57,15 @@ char *fs_read_file(const char *path)
     fclose(f);
     return buf;
 }
+
+
+esp_err_t fs_write_file(const char *path, const char *data, size_t len)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return ESP_FAIL;
+    }
+    size_t w = fwrite(data, 1, len, f);
+    fclose(f);
+    return (w == len) ? ESP_OK : ESP_FAIL;
+}
