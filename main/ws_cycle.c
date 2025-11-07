@@ -147,6 +147,22 @@ esp_err_t ws_handler(httpd_req_t *req)
         cycle_skip_current_phase(true);
         ws_send_text(req, "ok: cycle stopped");
     }
+    // ========== COMMAND: skip_phase ==========
+    else if (strcmp(action->valuestring, "skip_phase") == 0) {
+        cycle_skip_current_phase(true);
+        ws_send_text(req, "ok: phase skipped");
+    }
+    // ========== COMMAND: skip_to_phase ==========
+    else if (strcmp(action->valuestring, "skip_to_phase") == 0) {
+        cJSON *index = cJSON_GetObjectItem(root, "index");
+        if (!index || !cJSON_IsNumber(index)) {
+            ws_send_text(req, "error: missing or invalid index for skip_to_phase");
+        } else {
+            int phase_index = index->valueint;
+            cycle_skip_to_phase((size_t)phase_index);
+            ws_send_text(req, "ok: skipping to phase");
+        }
+    }
     else {
         ws_send_text(req, "error: unknown action");
     }

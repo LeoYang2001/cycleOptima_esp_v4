@@ -12,9 +12,12 @@
 static const char *TAG = "wifi_sta";
 
 // TODO: put your router SSID/PASS here for now
-#define WIFI_SSID "CycleOptima-dedicate"
-#define WIFI_PASS "Alpha2700"
+// #define WIFI_SSID "CycleOptima-dedicate"
+// #define WIFI_PASS "Alpha2700"
+#define WIFI_SSID "LeoEspTest"
+#define WIFI_PASS "20010209"
 #define WIFI_MAX_RETRY 5
+
 
 static int s_retry_num = 0;
 static bool s_connected = false;

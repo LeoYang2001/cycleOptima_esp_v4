@@ -18,17 +18,17 @@
             "label": "Motor",
             "start": 0,
             "compId": "Motor",
-            "duration": 15000,
+            "duration": 48000,
             "motorConfig": {
-              "repeatTimes": 5,
+              "repeatTimes": 30,
               "pattern": [
                 {
-                  "stepTime": 1000,
+                  "stepTime": 300,
                   "pauseTime": 500,
                   "direction": "cw"
                 },
                 {
-                  "stepTime": 1000,
+                  "stepTime": 300,
                   "pauseTime": 500,
                   "direction": "ccw"
                 }

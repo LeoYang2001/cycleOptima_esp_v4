@@ -30,6 +30,7 @@ static uint64_t phase_start_us = 0;
 static bool cycle_running = false;
 static TaskHandle_t monitor_task_handle = NULL;
 static const char *current_phase_name = "N/A";
+static int target_phase_index = -1;  // -1 means no skip, otherwise jump to this phase
 
 // Global state for loaded cycle (for cycle_load_from_json_str + cycle_run_loaded_cycle)
 static Phase g_phases[MAX_PHASES];
@@ -384,6 +385,27 @@ size_t build_timeline_from_phase(const Phase *phase,
         }
     }
 
+    // Log the built timeline
+    ESP_LOGI(TAG, "=== Timeline for phase '%s' (%zu events) ===", phase->name, idx);
+    for (size_t i = 0; i < idx; i++) {
+        const TimelineEvent *ev = &out_events[i];
+        const char *event_type = (ev->type == EVENT_ON) ? "ON " : "OFF";
+        const char *pin_name = "UNKNOWN";
+        
+        // Map pin to component name
+        for (size_t j = 0; j < COMPONENT_PIN_MAP_LEN; j++) {
+            if (COMPONENT_PIN_MAP[j].pin == ev->pin) {
+                pin_name = COMPONENT_PIN_MAP[j].compId;
+                break;
+            }
+        }
+        
+        uint32_t fire_time_ms = ev->fire_time_us / 1000;
+        ESP_LOGI(TAG, "  [%3u ms] %s GPIO%2d (%s) level=%d", 
+                 fire_time_ms, event_type, ev->pin, pin_name, ev->level);
+    }
+    ESP_LOGI(TAG, "=== End timeline ===");
+
     return idx;
 }
 // ------------------------- TIMER CALLBACK -------------------------
@@ -505,17 +527,43 @@ void cycle_skip_current_phase(bool force_off_all)
     }
 
     g_phase_ctx.active = false;
-    cycle_running = false;
+    // NOTE: do NOT set cycle_running = false here; let run_cycle() control it
     ESP_LOGW(TAG, "Current phase skipped/cancelled.");
+}
+
+void cycle_skip_to_phase(size_t phase_index)
+{
+    if (!cycle_running) {
+        ESP_LOGW(TAG, "cycle_skip_to_phase: no cycle running");
+        return;
+    }
+
+    // Set target phase and skip current
+    target_phase_index = (int)phase_index;
+    cycle_skip_current_phase(true);
+    ESP_LOGI(TAG, "Skipping to phase %zu", phase_index);
 }
 
 
 void run_cycle(Phase *phases, size_t num_phases)
 {
     cycle_running = true;
+    target_phase_index = -1;
     start_gpio_monitor();
 
     for (size_t i = 0; i < num_phases; i++) {
+        // Check if we should skip to a different phase
+        if (target_phase_index >= 0) {
+            if (target_phase_index >= (int)num_phases) {
+                ESP_LOGW(TAG, "skip_to_phase index out of bounds (%d >= %zu)", target_phase_index, num_phases);
+                target_phase_index = -1;
+                break;
+            }
+            i = target_phase_index - 1;  // -1 because loop will increment
+            target_phase_index = -1;
+            continue;
+        }
+
         Phase *p = &phases[i];
 
         ESP_LOGI(TAG, "=== Running phase %d: %s ===", (int)i, p->name);

@@ -82,6 +82,7 @@ esp_err_t cycle_load_from_json_str(const char *json_str);
 void cycle_run_loaded_cycle(void);
 void init_all_gpio(void);
 void cycle_skip_current_phase(bool force_off_all);
+void cycle_skip_to_phase(size_t phase_index);
 bool cycle_is_running(void);
 
 
