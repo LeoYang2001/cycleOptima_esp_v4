@@ -87,8 +87,6 @@ bool cycle_is_running(void);
 
 
 // ------------------------- API -------------------------
-void start_gpio_monitor(void);
-void stop_gpio_monitor(void);
 void run_phase_with_esp_timer(const Phase *phase);
 void run_cycle(Phase *phases, size_t num_phases);
 
