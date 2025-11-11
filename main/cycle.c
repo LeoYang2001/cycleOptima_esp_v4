@@ -25,6 +25,11 @@
     static size_t g_motor_cfg_used  = 0;
     static size_t g_motor_steps_used = 0;
 
+    // Sensor trigger pool (one per phase max)
+    #define MAX_SENSOR_TRIGGERS MAX_PHASES
+    static SensorTrigger g_sensor_trigger_pool[MAX_SENSOR_TRIGGERS];
+    static size_t g_sensor_trigger_used = 0;
+
 //GLOBAL VARIABLE
 uint64_t phase_start_us = 0;  // track phase start time (non-static for telemetry access)
 bool cycle_running = false;  // non-static for telemetry access
@@ -43,8 +48,7 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
     };
 
     // ------------------ PHASE RUN CONTEXT ------------------
-    // we want to be able to cancel timers later
-    #define MAX_EVENTS_PER_PHASE 24
+    #define MAX_EVENTS_PER_PHASE 2048  // increased to handle complex cycles
 
     typedef struct {
         TimelineEvent events[MAX_EVENTS_PER_PHASE];
@@ -174,6 +178,45 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                     } else {
                         ESP_LOGW(TAG, "motorConfig present but motor cfg pool is full");
                     }
+                }
+            }
+
+            // Parse optional sensorTrigger for this phase
+            cJSON *sensorTrigger = cJSON_GetObjectItem(pjson, "sensorTrigger");
+            p->sensor_trigger = NULL;  // default: no trigger
+            
+            if (sensorTrigger && !cJSON_IsNull(sensorTrigger)) {
+                if (g_sensor_trigger_used < MAX_SENSOR_TRIGGERS) {
+                    SensorTrigger *st = &g_sensor_trigger_pool[g_sensor_trigger_used++];
+                    memset(st, 0, sizeof(SensorTrigger));
+                    
+                    // Parse sensor type
+                    cJSON *type = cJSON_GetObjectItem(sensorTrigger, "type");
+                    const char *type_str = type ? type->valuestring : "RPM";
+                    if (strcmp(type_str, "RPM") == 0) {
+                        st->type = SENSOR_TYPE_RPM;
+                    } else if (strcmp(type_str, "PRESSURE") == 0) {
+                        st->type = SENSOR_TYPE_PRESSURE;
+                    } else {
+                        st->type = SENSOR_TYPE_UNKNOWN;
+                    }
+                    
+                    // Parse threshold
+                    cJSON *threshold = cJSON_GetObjectItem(sensorTrigger, "threshold");
+                    st->threshold = threshold ? (uint32_t)threshold->valueint : 0;
+                    
+                    // Parse trigger direction
+                    cJSON *triggerAbove = cJSON_GetObjectItem(sensorTrigger, "triggerAbove");
+                    st->trigger_above = triggerAbove ? triggerAbove->type == cJSON_True : true;
+                    
+                    // Track that trigger hasn't fired yet
+                    st->has_triggered = false;
+                    
+                    p->sensor_trigger = st;
+                    ESP_LOGI(TAG, "Phase '%s': sensor trigger configured (type=%d, threshold=%u, above=%d)",
+                             p->name, st->type, st->threshold, st->trigger_above);
+                } else {
+                    ESP_LOGW(TAG, "sensor_trigger pool full, ignoring trigger for phase '%s'", p->name);
                 }
             }
         }
@@ -566,12 +609,14 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
             return ESP_FAIL;
         }
 
-        // reset motor pools and phase count
+        // reset motor pools, sensor trigger pool, and phase count
         g_motor_cfg_used = 0;
         g_motor_steps_used = 0;
+        g_sensor_trigger_used = 0;
         g_num_phases = 0;
         memset(g_phases, 0, sizeof(g_phases));
         memset(g_components_pool, 0, sizeof(g_components_pool));
+        memset(g_sensor_trigger_pool, 0, sizeof(g_sensor_trigger_pool));
 
         // Use existing parser
         esp_err_t ret = load_cycle_from_json_str(

@@ -30,6 +30,20 @@ typedef struct {
     const char *direction;    // "cw" or "ccw"
 } MotorPatternStep;
 
+// -------------------- SENSOR TRIGGER TYPES --------------------
+typedef enum {
+    SENSOR_TYPE_RPM,
+    SENSOR_TYPE_PRESSURE,
+    SENSOR_TYPE_UNKNOWN
+} SensorTriggerType;
+
+typedef struct {
+    SensorTriggerType type;           // RPM or PRESSURE
+    uint32_t threshold;               // Threshold value
+    bool trigger_above;               // true: trigger when > threshold, false: trigger when < threshold
+    bool has_triggered;               // Track if already triggered in this phase
+} SensorTrigger;
+
 // the full motorConfig block
 typedef struct {
     int repeat_times;               // "repeatTimes"
@@ -56,6 +70,7 @@ typedef struct {
     uint32_t        start_time_ms;
     PhaseComponent *components;
     size_t          num_components;
+    SensorTrigger  *sensor_trigger;  // Optional: nullptr if no trigger
 } Phase;
 
 typedef enum {
