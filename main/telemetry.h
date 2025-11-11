@@ -21,11 +21,10 @@ typedef struct {
     uint64_t timestamp_ms;
 } GpioTelemetry;
 
-// Sensor data (expandable for future sensors)
+// Sensor data
 typedef struct {
-    float temperature;      // e.g., from temp sensor
-    float pressure;         // e.g., from pressure sensor
-    float flow_rate;        // e.g., from flow sensor
+    float rpm;              // motor RPM from rpm_sensor
+    float pressure_freq;    // pressure frequency (Hz) from pressure_sensor
     bool sensor_error;
     uint64_t timestamp_ms;
 } SensorTelemetry;
@@ -90,3 +89,4 @@ void telemetry_update_sensor(const SensorTelemetry *sensor_data);
  * Thread-safe
  */
 void telemetry_update_cycle(const CycleTelemetry *cycle_data);
+

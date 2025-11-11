@@ -1,6 +1,8 @@
 // telemetry.c
 #include "telemetry.h"
 #include "cycle.h"
+#include "rpm_sensor.h"
+#include "pressure_sensor.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
@@ -46,14 +48,16 @@ static void gather_gpio_telemetry(GpioTelemetry *gpio_tel)
 }
 
 /**
- * Gather sensor data (placeholder for now)
+ * Gather sensor data (RPM from rpm_sensor, pressure frequency from pressure_sensor)
  */
 static void gather_sensor_telemetry(SensorTelemetry *sensor_tel)
 {
-    // TODO: read actual sensors (ADC, temperature, flow, etc.)
-    sensor_tel->temperature = 0.0f;
-    sensor_tel->pressure = 0.0f;
-    sensor_tel->flow_rate = 0.0f;
+    // Read RPM from the rpm_sensor module
+    sensor_tel->rpm = rpm_sensor_get_rpm();
+    
+    // Read pressure frequency (Hz) from the pressure_sensor module
+    sensor_tel->pressure_freq = pressure_sensor_read_frequency();
+    
     sensor_tel->sensor_error = false;
     sensor_tel->timestamp_ms = esp_timer_get_time() / 1000;
 }
@@ -111,18 +115,18 @@ static void telemetry_task(void *pvParameter)
             g_telemetry_callback(&packet);
         }
 
-        // Log to console only when cycle is running (GPIO states, cycle info, sensors)
+        // Log to console only when cycle is running (GPIO states, cycle info, RPM, pressure frequency)
         if (packet.cycle.cycle_running) {
             printf("[%lu ms] GPIO: ", packet.cycle.phase_elapsed_ms);
             for (int i = 0; i < packet.gpio.num_pins; i++) {
                 printf("%d:%d ", packet.gpio.pins[i].pin_number, packet.gpio.pins[i].state);
             }
-            printf(" | Cycle: %s (Phase: %ld/%lu) | Sensors: T=%.1f°C P=%.1f\n",
+            printf(" | Cycle: %s (Phase: %ld/%lu) | RPM: %.0f | PressFreq: %.2f Hz\n",
                    packet.cycle.cycle_running ? "RUNNING" : "IDLE",
                    (long)packet.cycle.current_phase_index + 1,
                    (unsigned long)packet.cycle.total_phases,
-                   packet.sensors.temperature,
-                   packet.sensors.pressure);
+                   packet.sensors.rpm,
+                   packet.sensors.pressure_freq);
         }
 
         // Wait for next update interval
@@ -223,3 +227,5 @@ void telemetry_update_cycle(const CycleTelemetry *cycle_data)
         xSemaphoreGive(telemetry_mutex);
     }
 }
+
+

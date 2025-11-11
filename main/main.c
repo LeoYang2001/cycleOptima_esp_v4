@@ -9,6 +9,8 @@
 #include "wifi_sta.h"
 #include "ws_cycle.h"
 #include "telemetry.h"
+#include "rpm_sensor.h"
+#include "pressure_sensor.h"
 
 
 static const char *TAG = "main";
@@ -56,16 +58,23 @@ void app_main(void)
     // 1) hardware ready
     init_all_gpio();
 
-    // 2) start telemetry system (gathers GPIO, sensors, cycle info)
+    // 2) initialize RPM sensor (GPIO 0 with rising-edge detection)
+    rpm_sensor_init();
+
+    // 3) initialize pressure sensor (HX711 on GPIO 2/3)
+    pressure_sensor_init();
+    
+
+    // 4) start telemetry system (gathers GPIO, sensors, cycle info)
     telemetry_init(100);  // update every 100ms
 
-    // 3) mount SPIFFS
+    // 5) mount SPIFFS
     if (fs_init_spiffs() != ESP_OK) {
         ESP_LOGE(TAG, "SPIFFS init failed");
         // we can still continue for websocket-only testing
     }
 
-    // 4) try to load existing cycle.json, but DO NOT run it yet
+    // 6) try to load existing cycle.json, but DO NOT run it yet
     {
         char *json_str = fs_read_file("/spiffs/cycle.json");
         if (json_str) {
@@ -80,7 +89,7 @@ void app_main(void)
         }
     }
 
-    // 5) start ONE task that will: Wi-Fi -> websocket
+    // 7) start ONE task that will: Wi-Fi -> websocket
     xTaskCreate(
         net_task,
         "net_task",
@@ -90,7 +99,7 @@ void app_main(void)
         NULL
     );
 
-    // 6) main loop just idles; control comes from websocket
+    // 8) main loop just idles; control comes from websocket
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

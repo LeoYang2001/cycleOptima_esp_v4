@@ -10,4 +10,3 @@ esp_err_t ws_cycle_start(void);
 
 // Get the WebSocket server port (for logging after IP is obtained)
 uint16_t ws_cycle_get_port(void);
-
