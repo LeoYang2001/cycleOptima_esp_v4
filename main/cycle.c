@@ -29,11 +29,11 @@
 uint64_t phase_start_us = 0;  // track phase start time (non-static for telemetry access)
 bool cycle_running = false;  // non-static for telemetry access
 const char *current_phase_name = "N/A";  // non-static for telemetry access
-static int target_phase_index = -1;  // -1 means no skip, otherwise jump to this phase
+static int target_phase_index = -1;  // -1 means no skip, -2 means stop cycle, otherwise jump to this phase
 int current_phase_index = 0;  // track which phase we're currently running (accessible to telemetry)
 
 // Global state for loaded cycle (for cycle_load_from_json_str + cycle_run_loaded_cycle)
-static Phase g_phases[MAX_PHASES];
+Phase g_phases[MAX_PHASES];  // non-static for telemetry/WebSocket access
 static PhaseComponent g_components_pool[MAX_PHASES * MAX_COMPONENTS_PER_PHASE];
 size_t g_num_phases = 0;  // non-static for telemetry access    // ------------------ PIN + SHADOW ------------------
     int gpio_shadow[NUM_COMPONENTS];
@@ -501,6 +501,19 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
         ESP_LOGI(TAG, "Skipping to phase %zu", phase_index);
     }
 
+    void cycle_stop(void)
+    {
+        if (!cycle_running) {
+            ESP_LOGW(TAG, "cycle_stop: no cycle running");
+            return;
+        }
+
+        // Set special stop flag
+        target_phase_index = -2;
+        cycle_skip_current_phase(true);
+        ESP_LOGI(TAG, "Cycle stop requested");
+    }
+
 
     void run_cycle(Phase *phases, size_t num_phases)
     {
@@ -508,6 +521,13 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
         target_phase_index = -1;
 
         for (size_t i = 0; i < num_phases; i++) {
+            // Check if we should stop the entire cycle
+            if (target_phase_index == -2) {
+                ESP_LOGW(TAG, "Cycle stop signal detected, breaking out of cycle loop");
+                target_phase_index = -1;
+                break;
+            }
+
             // Check if we should skip to a different phase
             if (target_phase_index >= 0) {
                 if (target_phase_index >= (int)num_phases) {
@@ -520,10 +540,10 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                 continue;
             }
 
-            current_phase_index = (int)i;  // update current phase index for telemetry
+            current_phase_index = (int)i + 1;  // update current phase index for telemetry
             Phase *p = &phases[i];
 
-            ESP_LOGI(TAG, "=== Running phase %d: %s ===", (int)i, p->name);
+            ESP_LOGI(TAG, "=== Running phase %d: %s ===", (int)i + 1, p->name);
             run_phase_with_esp_timer(p);
 
             while (g_phase_ctx.active) {

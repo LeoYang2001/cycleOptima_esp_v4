@@ -1,4 +1,3 @@
-// ws_cycle.c
 #include "ws_cycle.h"
 
 #include <string.h>
@@ -169,7 +168,7 @@ esp_err_t ws_handler(httpd_req_t *req)
     }
     // ========== COMMAND: stop_cycle ==========
     else if (strcmp(action->valuestring, "stop_cycle") == 0) {
-        cycle_skip_current_phase(true);
+        cycle_stop();
         ws_send_text(req, "ok: cycle stopped");
     }
     // ========== COMMAND: skip_phase ==========
@@ -186,6 +185,38 @@ esp_err_t ws_handler(httpd_req_t *req)
             int phase_index = index->valueint;
             cycle_skip_to_phase((size_t)phase_index);
             ws_send_text(req, "ok: skipping to phase");
+        }
+    }
+    // ========== COMMAND: toggle_gpio ==========
+    else if (strcmp(action->valuestring, "toggle_gpio") == 0) {
+        cJSON *pin = cJSON_GetObjectItem(root, "pin");
+        cJSON *state = cJSON_GetObjectItem(root, "state");
+        
+        if (!pin || !cJSON_IsNumber(pin)) {
+            ws_send_text(req, "error: missing or invalid pin number");
+        } else if (!state || !cJSON_IsNumber(state)) {
+            ws_send_text(req, "error: missing or invalid state (0 or 1)");
+        } else {
+            int pin_num = pin->valueint;
+            int pin_state = state->valueint;
+            
+            // Set GPIO state
+            gpio_set_level((gpio_num_t)pin_num, pin_state);
+            
+            // Also update gpio_shadow[] so telemetry reflects the change
+            extern int gpio_shadow[NUM_COMPONENTS];
+            extern const gpio_num_t all_pins[NUM_COMPONENTS];
+            for (int i = 0; i < NUM_COMPONENTS; i++) {
+                if (all_pins[i] == pin_num) {
+                    gpio_shadow[i] = pin_state;
+                    break;
+                }
+            }
+            
+            char response[100];
+            snprintf(response, sizeof(response), "ok: GPIO %d set to %d", pin_num, pin_state);
+            ws_send_text(req, response);
+            ESP_LOGI(TAG, "GPIO %d toggled to %d", pin_num, pin_state);
         }
     }
     else {
@@ -226,7 +257,7 @@ static void telemetry_callback(const TelemetryPacket *packet)
     cJSON_AddNumberToObject(sensors, "pressure_freq", packet->sensors.pressure_freq);
     cJSON_AddBoolToObject(sensors, "sensor_error", packet->sensors.sensor_error);
 
-    // Cycle data
+    // Cycle data (current execution state)
     cJSON *cycle = cJSON_AddObjectToObject(root, "cycle");
     cJSON_AddBoolToObject(cycle, "cycle_running", packet->cycle.cycle_running);
     cJSON_AddNumberToObject(cycle, "current_phase_index", packet->cycle.current_phase_index);
@@ -235,6 +266,38 @@ static void telemetry_callback(const TelemetryPacket *packet)
     cJSON_AddNumberToObject(cycle, "phase_elapsed_ms", packet->cycle.phase_elapsed_ms);
     cJSON_AddNumberToObject(cycle, "phase_total_duration_ms", packet->cycle.phase_total_duration_ms);
     cJSON_AddNumberToObject(cycle, "cycle_start_time_ms", packet->cycle.cycle_start_time_ms);
+
+    // Cycledata: full cycle structure with all phases and components
+    cJSON *cycle_data = cJSON_AddArrayToObject(root, "cycle_data");
+    
+    for (size_t pi = 0; pi < packet->cycle.total_phases && pi < MAX_PHASES; pi++) {
+        Phase *phase = &g_phases[pi];
+        cJSON *phase_obj = cJSON_CreateObject();
+        
+        // Phase metadata
+        cJSON_AddStringToObject(phase_obj, "id", phase->id ? phase->id : "");
+        cJSON_AddStringToObject(phase_obj, "name", phase->name ? phase->name : "");
+        cJSON_AddStringToObject(phase_obj, "color", phase->color ? phase->color : "");
+        cJSON_AddNumberToObject(phase_obj, "start_time_ms", phase->start_time_ms);
+        
+        // Phase components
+        cJSON *components_array = cJSON_AddArrayToObject(phase_obj, "components");
+        for (size_t ci = 0; ci < phase->num_components; ci++) {
+            PhaseComponent *comp = &phase->components[ci];
+            cJSON *comp_obj = cJSON_CreateObject();
+            
+            cJSON_AddStringToObject(comp_obj, "id", comp->id ? comp->id : "");
+            cJSON_AddStringToObject(comp_obj, "label", comp->label ? comp->label : "");
+            cJSON_AddStringToObject(comp_obj, "compId", comp->compId ? comp->compId : "");
+            cJSON_AddNumberToObject(comp_obj, "start_ms", comp->start_ms);
+            cJSON_AddNumberToObject(comp_obj, "duration_ms", comp->duration_ms);
+            cJSON_AddBoolToObject(comp_obj, "has_motor", comp->has_motor);
+            
+            cJSON_AddItemToArray(components_array, comp_obj);
+        }
+        
+        cJSON_AddItemToArray(cycle_data, phase_obj);
+    }
 
     // Serialize to JSON string
     char *json_str = cJSON_PrintUnformatted(root);

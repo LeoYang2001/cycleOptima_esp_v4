@@ -18,6 +18,10 @@
 #define FLOW_SENSOR_PIN      GPIO_NUM_0
 #define NUM_COMPONENTS       8
 
+// Max limits
+#define MAX_PHASES           16
+#define MAX_COMPONENTS_PER_PHASE 16
+
 // -------------------- MOTOR TYPES --------------------
 // one entry in "pattern": { stepTime, pauseTime, direction }
 typedef struct {
@@ -75,14 +79,21 @@ esp_err_t load_cycle_from_json_str(const char *json_str,
                                    size_t max_components_per_phase,
                                    size_t *out_num_phases);
 
+// -------------------- GLOBAL STATE (accessible to WebSocket/telemetry) --------------------
+extern Phase g_phases[MAX_PHASES];  // All loaded phases
+extern size_t g_num_phases;         // Number of loaded phases
+extern uint64_t phase_start_us;     // Start time of current phase
+extern bool cycle_running;          // Current cycle execution state
+extern const char *current_phase_name;  // Name of current phase
+extern int current_phase_index;     // Index of current phase
 
-
- // STATE MACHINE FUNCTIONS
+// -------------------- STATE MACHINE FUNCTIONS --------------------
 esp_err_t cycle_load_from_json_str(const char *json_str);
 void cycle_run_loaded_cycle(void);
 void init_all_gpio(void);
 void cycle_skip_current_phase(bool force_off_all);
 void cycle_skip_to_phase(size_t phase_index);
+void cycle_stop(void);
 bool cycle_is_running(void);
 
 
