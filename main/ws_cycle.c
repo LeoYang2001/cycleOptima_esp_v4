@@ -12,8 +12,9 @@
 
 #include "cJSON.h"
 
-#include "fs.h"      // fs_write_file(...)
-#include "cycle.h"   // cycle_load_from_json_str(...), cycle_run_loaded_cycle(...)
+#include "fs.h"           // fs_write_file(...)
+#include "cycle.h"        // cycle_load_from_json_str(...), cycle_run_loaded_cycle(...)
+#include "telemetry.h"    // TelemetryPacket, telemetry_set_callback()
 
 static const char *TAG = "ws_cycle";
 
@@ -24,6 +25,30 @@ static uint16_t s_server_port = 0;  // Store port for external logging
 uint16_t ws_cycle_get_port(void)
 {
     return s_server_port;
+}
+
+// Broadcast a message to all connected WebSocket clients
+void ws_broadcast_text(const char *msg)
+{
+    if (!s_server) {
+        return;  // Server not started yet
+    }
+
+    httpd_ws_frame_t ws_pkt = {
+        .final = true,
+        .fragmented = false,
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)msg,
+        .len = strlen(msg),
+    };
+
+    // Use the synchronous send to all connected clients
+    // This iterates through all file descriptors and sends to WebSocket clients
+    for (int fd = 0; fd < FD_SETSIZE; fd++) {
+        if (httpd_ws_send_frame_async(s_server, fd, &ws_pkt) == ESP_OK) {
+            // Frame sent successfully to this client
+        }
+    }
 }
 
 
@@ -171,6 +196,58 @@ esp_err_t ws_handler(httpd_req_t *req)
     free(buf);
     return ESP_OK;
 }
+
+// ====================== TELEMETRY CALLBACK ======================
+
+// Callback function that converts telemetry packet to JSON and broadcasts via WebSocket
+static void telemetry_callback(const TelemetryPacket *packet)
+{
+    if (!packet) return;
+
+    // Build JSON object with telemetry data
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+
+    cJSON_AddStringToObject(root, "type", "telemetry");
+    cJSON_AddNumberToObject(root, "packet_timestamp_ms", packet->packet_timestamp_ms);
+
+    // GPIO data
+    cJSON *gpio_array = cJSON_AddArrayToObject(root, "gpio");
+    for (int i = 0; i < packet->gpio.num_pins; i++) {
+        cJSON *gpio_obj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(gpio_obj, "pin", packet->gpio.pins[i].pin_number);
+        cJSON_AddNumberToObject(gpio_obj, "state", packet->gpio.pins[i].state);
+        cJSON_AddItemToArray(gpio_array, gpio_obj);
+    }
+
+    // Sensor data
+    cJSON *sensors = cJSON_AddObjectToObject(root, "sensors");
+    cJSON_AddNumberToObject(sensors, "rpm", packet->sensors.rpm);
+    cJSON_AddNumberToObject(sensors, "pressure_freq", packet->sensors.pressure_freq);
+    cJSON_AddBoolToObject(sensors, "sensor_error", packet->sensors.sensor_error);
+
+    // Cycle data
+    cJSON *cycle = cJSON_AddObjectToObject(root, "cycle");
+    cJSON_AddBoolToObject(cycle, "cycle_running", packet->cycle.cycle_running);
+    cJSON_AddNumberToObject(cycle, "current_phase_index", packet->cycle.current_phase_index);
+    cJSON_AddStringToObject(cycle, "current_phase_name", packet->cycle.current_phase_name);
+    cJSON_AddNumberToObject(cycle, "total_phases", packet->cycle.total_phases);
+    cJSON_AddNumberToObject(cycle, "phase_elapsed_ms", packet->cycle.phase_elapsed_ms);
+    cJSON_AddNumberToObject(cycle, "phase_total_duration_ms", packet->cycle.phase_total_duration_ms);
+    cJSON_AddNumberToObject(cycle, "cycle_start_time_ms", packet->cycle.cycle_start_time_ms);
+
+    // Serialize to JSON string
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str) {
+        ws_broadcast_text(json_str);
+        free(json_str);
+    }
+
+    cJSON_Delete(root);
+}
+
+// ====================== WS CYCLE START ======================
+
 esp_err_t ws_cycle_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -209,4 +286,10 @@ esp_err_t ws_cycle_start(void)
     }
 
     return ESP_OK;
+}
+
+void ws_register_telemetry_callback(void)
+{
+    telemetry_set_callback(telemetry_callback);
+    ESP_LOGI(TAG, "Telemetry callback registered for WebSocket broadcast");
 }

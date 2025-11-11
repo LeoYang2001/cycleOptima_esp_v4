@@ -10,3 +10,10 @@ esp_err_t ws_cycle_start(void);
 
 // Get the WebSocket server port (for logging after IP is obtained)
 uint16_t ws_cycle_get_port(void);
+
+// Broadcast a text message to all connected WebSocket clients
+void ws_broadcast_text(const char *msg);
+
+// Register telemetry callback with the telemetry system
+// Call this after telemetry_init() to enable real-time WebSocket streaming
+void ws_register_telemetry_callback(void);

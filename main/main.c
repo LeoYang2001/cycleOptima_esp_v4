@@ -68,6 +68,9 @@ void app_main(void)
     // 4) start telemetry system (gathers GPIO, sensors, cycle info)
     telemetry_init(100);  // update every 100ms
 
+    // 4b) register telemetry callback for WebSocket broadcast (will be activated after ws_cycle_start)
+    ws_register_telemetry_callback();
+
     // 5) mount SPIFFS
     if (fs_init_spiffs() != ESP_OK) {
         ESP_LOGE(TAG, "SPIFFS init failed");
