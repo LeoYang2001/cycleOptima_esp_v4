@@ -306,4 +306,3 @@ void telemetry_update_cycle(const CycleTelemetry *cycle_data)
         xSemaphoreGive(telemetry_mutex);
     }
 }
-

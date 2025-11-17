@@ -17,3 +17,8 @@ void ws_broadcast_text(const char *msg);
 // Register telemetry callback with the telemetry system
 // Call this after telemetry_init() to enable real-time WebSocket streaming
 void ws_register_telemetry_callback(void);
+
+// Update the cached cycle_data structure (call when a new cycle is loaded)
+// This optimizes telemetry broadcasts by caching static cycle data
+void ws_update_cycle_data_cache(void);
+

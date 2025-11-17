@@ -10,6 +10,8 @@
 #include "esp_wifi.h"
 
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "fs.h"           // fs_write_file(...)
 #include "cycle.h"        // cycle_load_from_json_str(...), cycle_run_loaded_cycle(...)
@@ -20,6 +22,14 @@ static const char *TAG = "ws_cycle";
 static httpd_handle_t s_server = NULL;
 
 static uint16_t s_server_port = 0;  // Store port for external logging
+
+// Structure for passing JSON data to processing task
+typedef struct {
+    char *json_data;
+    size_t json_length;
+    httpd_req_t *req;
+    bool success;
+} json_task_params_t;
 
 uint16_t ws_cycle_get_port(void)
 {
@@ -48,6 +58,43 @@ void ws_broadcast_text(const char *msg)
             // Frame sent successfully to this client
         }
     }
+}
+
+// Task to process large JSON in a separate context with more stack space
+static void json_processing_task(void *pvParameters)
+{
+    json_task_params_t *params = (json_task_params_t *)pvParameters;
+    
+    ESP_LOGI(TAG, "JSON processing task started with %zu byte JSON", params->json_length);
+    
+    // Check available heap in this task
+    size_t free_heap = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "Free heap in processing task: %zu bytes", free_heap);
+    
+    // Write to SPIFFS first
+    ESP_LOGI(TAG, "Writing to SPIFFS...");
+    if (fs_write_file("/spiffs/cycle.json", params->json_data, params->json_length) == ESP_OK) {
+        ESP_LOGI(TAG, "cycle.json updated via websocket (%zu bytes)", params->json_length);
+    } else {
+        ESP_LOGE(TAG, "failed to write cycle.json to spiffs");
+        params->success = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Load into RAM using extracted cycle JSON string
+    ESP_LOGI(TAG, "Loading cycle into RAM...");
+    esp_err_t load_result = cycle_load_from_json_str(params->json_data);
+    if (load_result == ESP_OK) {
+        ESP_LOGI(TAG, "Cycle loaded successfully");
+        params->success = true;
+    } else {
+        ESP_LOGE(TAG, "Cycle load failed with error: %d", load_result);
+        params->success = false;
+    }
+    
+    // Task will be cleaned up by caller
+    vTaskDelete(NULL);
 }
 
 
@@ -91,10 +138,12 @@ esp_err_t ws_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    ESP_LOGI(TAG, "WebSocket frame size: %zu bytes", ws_pkt.len);
+
     // Step 2: allocate buffer and read the actual frame
     char *buf = malloc(ws_pkt.len + 1);
     if (!buf) {
-        ESP_LOGE(TAG, "malloc failed for WS frame");
+        ESP_LOGE(TAG, "malloc failed for WS frame (size: %zu bytes)", ws_pkt.len);
         return ESP_ERR_NO_MEM;
     }
 
@@ -107,7 +156,17 @@ esp_err_t ws_handler(httpd_req_t *req)
     }
 
     buf[ws_pkt.len] = '\0';
-    ESP_LOGI(TAG, "WS recv: %s", buf);
+    ESP_LOGI(TAG, "WS recv (%zu bytes): %.100s%s", ws_pkt.len, buf, 
+             ws_pkt.len > 100 ? "..." : "");  // Show first 100 chars + ...
+    
+    // Verify JSON completeness
+    size_t open_braces = 0, close_braces = 0;
+    for (size_t i = 0; i < ws_pkt.len; i++) {
+        if (buf[i] == '{') open_braces++;
+        if (buf[i] == '}') close_braces++;
+    }
+    ESP_LOGI(TAG, "JSON structure check - Open braces: %zu, Close braces: %zu", 
+             open_braces, close_braces);
 
     // Parse JSON command
     cJSON *root = cJSON_Parse(buf);
@@ -135,26 +194,86 @@ esp_err_t ws_handler(httpd_req_t *req)
             // Stop current cycle if running
             cycle_skip_current_phase(true);
 
-            // Serialize data to JSON string
-            char *data_str = cJSON_PrintUnformatted(data);
-            if (data_str) {
-                // Write to SPIFFS
-                if (fs_write_file("/spiffs/cycle.json", data_str, strlen(data_str)) == ESP_OK) {
-                    ESP_LOGI(TAG, "cycle.json updated via websocket");
-                } else {
-                    ESP_LOGE(TAG, "failed to write cycle.json to spiffs");
-                }
+            // Check available heap memory before processing
+            size_t free_heap = esp_get_free_heap_size();
+            ESP_LOGI(TAG, "Free heap before processing: %zu bytes", free_heap);
 
-                // Load into RAM (stay IDLE until start_cycle)
-                if (cycle_load_from_json_str(data_str) == ESP_OK) {
-                    ws_send_text(req, "ok: json written and loaded");
-                } else {
-                    ws_send_text(req, "error: json written but failed to load");
-                }
-                free(data_str);
-            } else {
-                ws_send_text(req, "error: cannot serialize data");
+            // The data should be an object with a "phases" field
+            // Validate it has the structure we expect
+            if (!cJSON_IsObject(data)) {
+                ws_send_text(req, "error: data field must be an object");
+                cJSON_Delete(root);
+                free(buf);
+                return ESP_OK;
             }
+            
+            cJSON *phases = cJSON_GetObjectItem(data, "phases");
+            if (!phases || !cJSON_IsArray(phases)) {
+                ws_send_text(req, "error: data.phases must be an array");
+                cJSON_Delete(root);
+                free(buf);
+                return ESP_OK;
+            }
+
+            // SIMPLER APPROACH: Serialize directly to SPIFFS file
+            // Use unformatted JSON to save memory and time
+            ESP_LOGI(TAG, "Serializing cycle data directly to SPIFFS...");
+            
+            char *json_str = cJSON_PrintUnformatted(data);  // Compact, no extra whitespace
+            if (!json_str) {
+                ESP_LOGE(TAG, "Failed to serialize cycle data");
+                ws_send_text(req, "error: failed to serialize cycle data");
+                cJSON_Delete(root);
+                free(buf);
+                return ESP_FAIL;    
+            }
+            
+            size_t json_len = strlen(json_str);
+            ESP_LOGI(TAG, "Serialized cycle JSON: %zu bytes", json_len);
+
+            // Write directly to SPIFFS
+            ESP_LOGI(TAG, "Writing to SPIFFS...");
+            if (fs_write_file("/spiffs/cycle.json", json_str, json_len) == ESP_OK) {
+                ESP_LOGI(TAG, "cycle.json saved via websocket (%zu bytes)", json_len);
+            } else {
+                ESP_LOGE(TAG, "failed to write cycle.json to SPIFFS");
+                free(json_str);
+                cJSON_Delete(root);
+                free(buf);
+                return ESP_FAIL;
+            }
+
+            // Free the serialized JSON
+            free(json_str);
+            
+            // Now read from SPIFFS and load into RAM
+            // This gives us a fresh copy without any earlier parsing artifacts
+            ESP_LOGI(TAG, "Reading cycle.json from SPIFFS for parsing...");
+            char *spiffs_json = fs_read_file("/spiffs/cycle.json");
+            if (!spiffs_json) {
+                ESP_LOGE(TAG, "Failed to read cycle.json from SPIFFS");
+                cJSON_Delete(root);
+                free(buf);
+                return ESP_FAIL;
+            }
+
+            // Check memory before cycle loading
+            size_t free_heap_before_load = esp_get_free_heap_size();
+            ESP_LOGI(TAG, "Free heap before cycle load: %zu bytes", free_heap_before_load);
+
+            // Load into RAM using the SPIFFS data
+            ESP_LOGI(TAG, "Loading cycle into RAM...");
+            esp_err_t load_result = cycle_load_from_json_str(spiffs_json);
+            if (load_result == ESP_OK) {
+                ESP_LOGI(TAG, "Cycle loaded successfully");
+                ws_send_text(req, "ok: json written and loaded");
+            } else {
+                ESP_LOGE(TAG, "Cycle load failed with error: %d", load_result);
+                ws_send_text(req, "error: json written but failed to load");
+            }
+
+            // Free the SPIFFS buffer
+            free(spiffs_json);
         }
     }
     // ========== COMMAND: start_cycle ==========
@@ -230,12 +349,71 @@ esp_err_t ws_handler(httpd_req_t *req)
 
 // ====================== TELEMETRY CALLBACK ======================
 
+// Static cache for cycle_data structure (only updated when cycle loads, not every telemetry)
+static char *g_cycle_data_cache = NULL;
+static size_t g_cycle_data_cache_len = 0;
+
+/**
+ * Update the cached cycle_data JSON (called only when a new cycle is loaded)
+ * This prevents recreating the same structure 600 times per minute
+ */
+void ws_update_cycle_data_cache(void)
+{
+    // Free old cache
+    if (g_cycle_data_cache) {
+        free(g_cycle_data_cache);
+        g_cycle_data_cache = NULL;
+        g_cycle_data_cache_len = 0;
+    }
+
+    // Build cycle_data array once
+    cJSON *cycle_data = cJSON_CreateArray();
+    if (!cycle_data) return;
+
+    for (size_t pi = 0; pi < g_num_phases && pi < MAX_PHASES; pi++) {
+        Phase *phase = &g_phases[pi];
+        cJSON *phase_obj = cJSON_CreateObject();
+        
+        cJSON_AddStringToObject(phase_obj, "id", phase->id ? phase->id : "");
+        cJSON_AddStringToObject(phase_obj, "name", phase->id ? phase->id : "");
+        cJSON_AddNumberToObject(phase_obj, "start_time_ms", phase->start_time_ms);
+        
+        cJSON *components_array = cJSON_AddArrayToObject(phase_obj, "components");
+        for (size_t ci = 0; ci < phase->num_components; ci++) {
+            PhaseComponent *comp = &phase->components[ci];
+            cJSON *comp_obj = cJSON_CreateObject();
+            
+            cJSON_AddStringToObject(comp_obj, "id", comp->id ? comp->id : "");
+            cJSON_AddStringToObject(comp_obj, "label", comp->compId ? comp->compId : "");
+            cJSON_AddStringToObject(comp_obj, "compId", comp->compId ? comp->compId : "");
+            cJSON_AddNumberToObject(comp_obj, "start_ms", comp->start_ms);
+            cJSON_AddNumberToObject(comp_obj, "duration_ms", comp->duration_ms);
+            cJSON_AddBoolToObject(comp_obj, "has_motor", comp->has_motor);
+            
+            cJSON_AddItemToArray(components_array, comp_obj);
+        }
+        
+        cJSON_AddItemToArray(cycle_data, phase_obj);
+    }
+
+    // Serialize and cache
+    char *json_str = cJSON_PrintUnformatted(cycle_data);
+    if (json_str) {
+        g_cycle_data_cache = json_str;
+        g_cycle_data_cache_len = strlen(json_str);
+        ESP_LOGI(TAG, "Cycle data cache updated (%zu bytes)", g_cycle_data_cache_len);
+    }
+
+    cJSON_Delete(cycle_data);
+}
+
 // Callback function that converts telemetry packet to JSON and broadcasts via WebSocket
+// OPTIMIZED: Only sends live telemetry (GPIO, sensors, cycle state), not static cycle_data
 static void telemetry_callback(const TelemetryPacket *packet)
 {
     if (!packet) return;
 
-    // Build JSON object with telemetry data
+    // Build JSON object with ONLY live telemetry data (no cycle_data to reduce allocations)
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
 
@@ -257,47 +435,13 @@ static void telemetry_callback(const TelemetryPacket *packet)
     cJSON_AddNumberToObject(sensors, "pressure_freq", packet->sensors.pressure_freq);
     cJSON_AddBoolToObject(sensors, "sensor_error", packet->sensors.sensor_error);
 
-    // Cycle data (current execution state)
+    // Cycle data (current execution state only - not static structure)
     cJSON *cycle = cJSON_AddObjectToObject(root, "cycle");
     cJSON_AddBoolToObject(cycle, "cycle_running", packet->cycle.cycle_running);
     cJSON_AddNumberToObject(cycle, "current_phase_index", packet->cycle.current_phase_index);
     cJSON_AddStringToObject(cycle, "current_phase_name", packet->cycle.current_phase_name);
     cJSON_AddNumberToObject(cycle, "total_phases", packet->cycle.total_phases);
     cJSON_AddNumberToObject(cycle, "phase_elapsed_ms", packet->cycle.phase_elapsed_ms);
-    cJSON_AddNumberToObject(cycle, "phase_total_duration_ms", packet->cycle.phase_total_duration_ms);
-    cJSON_AddNumberToObject(cycle, "cycle_start_time_ms", packet->cycle.cycle_start_time_ms);
-
-    // Cycledata: full cycle structure with all phases and components
-    cJSON *cycle_data = cJSON_AddArrayToObject(root, "cycle_data");
-    
-    for (size_t pi = 0; pi < packet->cycle.total_phases && pi < MAX_PHASES; pi++) {
-        Phase *phase = &g_phases[pi];
-        cJSON *phase_obj = cJSON_CreateObject();
-        
-        // Phase metadata
-        cJSON_AddStringToObject(phase_obj, "id", phase->id ? phase->id : "");
-        cJSON_AddStringToObject(phase_obj, "name", phase->name ? phase->name : "");
-        cJSON_AddStringToObject(phase_obj, "color", phase->color ? phase->color : "");
-        cJSON_AddNumberToObject(phase_obj, "start_time_ms", phase->start_time_ms);
-        
-        // Phase components
-        cJSON *components_array = cJSON_AddArrayToObject(phase_obj, "components");
-        for (size_t ci = 0; ci < phase->num_components; ci++) {
-            PhaseComponent *comp = &phase->components[ci];
-            cJSON *comp_obj = cJSON_CreateObject();
-            
-            cJSON_AddStringToObject(comp_obj, "id", comp->id ? comp->id : "");
-            cJSON_AddStringToObject(comp_obj, "label", comp->label ? comp->label : "");
-            cJSON_AddStringToObject(comp_obj, "compId", comp->compId ? comp->compId : "");
-            cJSON_AddNumberToObject(comp_obj, "start_ms", comp->start_ms);
-            cJSON_AddNumberToObject(comp_obj, "duration_ms", comp->duration_ms);
-            cJSON_AddBoolToObject(comp_obj, "has_motor", comp->has_motor);
-            
-            cJSON_AddItemToArray(components_array, comp_obj);
-        }
-        
-        cJSON_AddItemToArray(cycle_data, phase_obj);
-    }
 
     // Serialize to JSON string
     char *json_str = cJSON_PrintUnformatted(root);
@@ -315,7 +459,15 @@ esp_err_t ws_cycle_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 8080;  // choose 8080 so 80 stays free
-  s_server_port = cfg.server_port;  
+    
+    // Increase WebSocket limits for large JSON messages
+    cfg.max_uri_handlers = 16;          // Default: 8
+    cfg.max_open_sockets = 7;           // Max allowed: 7 (3 used internally, 4 available)
+    cfg.send_wait_timeout = 10;         // Default: 5
+    cfg.recv_wait_timeout = 10;         // Default: 5
+    cfg.stack_size = 8192;              // Default: 4096 - increase for JSON parsing
+    
+    s_server_port = cfg.server_port;  
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
     if (ret != ESP_OK) {

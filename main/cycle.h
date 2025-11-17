@@ -18,9 +18,20 @@
 #define FLOW_SENSOR_PIN      GPIO_NUM_0
 #define NUM_COMPONENTS       8
 
-// Max limits
-#define MAX_PHASES           16
-#define MAX_COMPONENTS_PER_PHASE 16
+// ------------------------- SYSTEM LIMITS -------------------------
+// Phase and component limits
+#define MAX_PHASES                20   // Exact count for this cycle (was 12)
+#define MAX_COMPONENTS_PER_PHASE  6    // Max seen is 5, add 1 for safety (was 8)
+
+// Motor system limits  
+#define MAX_MOTOR_CONFIGS         12    // Exact count for this cycle (was 10)
+#define MAX_MOTOR_STEPS           4000 // Reduced from 4500, still handles 28×75=2100 + others
+
+// Sensor and trigger limits
+#define MAX_SENSOR_TRIGGERS       MAX_PHASES  // One sensor trigger per phase maximum
+
+// Timeline execution limits
+#define MAX_EVENTS_PER_PHASE      3200  // Reduced from 1024 - should handle largest motor patterns
 
 // -------------------- MOTOR TYPES --------------------
 // one entry in "pattern": { stepTime, pauseTime, direction }
@@ -49,13 +60,11 @@ typedef struct {
     int repeat_times;               // "repeatTimes"
     MotorPatternStep *pattern;      // array of steps
     size_t pattern_len;             // number of steps
-    const char *running_style;      // optional, e.g. "Single Direction"
 } MotorConfig;
 
 // -------------------- PHASE TYPES --------------------
 typedef struct {
     const char *id;
-    const char *label;
     const char *compId;
     uint32_t    start_ms;
     uint32_t    duration_ms;
@@ -65,8 +74,6 @@ typedef struct {
 
 typedef struct {
     const char     *id;
-    const char     *name;
-    const char     *color;
     uint32_t        start_time_ms;
     PhaseComponent *components;
     size_t          num_components;
@@ -110,11 +117,9 @@ void cycle_skip_current_phase(bool force_off_all);
 void cycle_skip_to_phase(size_t phase_index);
 void cycle_stop(void);
 bool cycle_is_running(void);
+void cycle_unload(void);  // Free memory from previously loaded cycle
 
 
 // ------------------------- API -------------------------
 void run_phase_with_esp_timer(const Phase *phase);
 void run_cycle(Phase *phases, size_t num_phases);
-
-
-

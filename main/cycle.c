@@ -1,4 +1,4 @@
-    // cycle.c
+// cycle.c
     #include "cycle.h"
     #include "esp_log.h"
     #include "esp_timer.h"
@@ -10,23 +10,22 @@
 
     #include "fs.h"
     #include "cJSON.h"
+    #include "rpm_sensor.h"      // for rpm_sensor_reset()
+    #include "pressure_sensor.h" // for pressure_sensor_reset()
+    #include "ws_cycle.h"        // for ws_update_cycle_data_cache()
 
     static const char *TAG = "cycle";
 
+// Keep track of parsed JSON root so we can free it when unloading
+static cJSON *g_loaded_cycle_json = NULL;
 
-    // how many motor-config-bearing components we can handle
-    #define MAX_MOTOR_CONFIGS  32
-    #define MAX_MOTOR_STEPS    128
-    #define MAX_PHASES         16
-    #define MAX_COMPONENTS_PER_PHASE 16
-
+    // Memory pools using limits defined in cycle.h
     static MotorConfig     g_motor_cfg_pool[MAX_MOTOR_CONFIGS];
     static MotorPatternStep g_motor_steps_pool[MAX_MOTOR_STEPS];
     static size_t g_motor_cfg_used  = 0;
     static size_t g_motor_steps_used = 0;
 
     // Sensor trigger pool (one per phase max)
-    #define MAX_SENSOR_TRIGGERS MAX_PHASES
     static SensorTrigger g_sensor_trigger_pool[MAX_SENSOR_TRIGGERS];
     static size_t g_sensor_trigger_used = 0;
 
@@ -48,14 +47,21 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
     };
 
     // ------------------ PHASE RUN CONTEXT ------------------
-    #define MAX_EVENTS_PER_PHASE 2048  // increased to handle complex cycles
-
+    #define BATCH_SIZE 200  // Max timers to create at once (heap-friendly)
+    
     typedef struct {
         TimelineEvent events[MAX_EVENTS_PER_PHASE];
-        esp_timer_handle_t timers[MAX_EVENTS_PER_PHASE];
+        esp_timer_handle_t timers[BATCH_SIZE];  // Only store current batch timers
         size_t num_events;
         size_t remaining_events;     
         bool   active;
+        
+        // Batch tracking
+        size_t current_batch_idx;       // Which batch are we on (0, 1, 2, ...)
+        size_t batches_total;           // Total number of batches
+        size_t next_batch_start_event;  // Index of first event in next batch
+        esp_timer_handle_t batch_timer; // Timer that signals batch completion
+        uint64_t batch_start_us;        // When this batch started (for timing)
     } PhaseRunContext;
 
     static PhaseRunContext g_phase_ctx;   // current / latest phase
@@ -67,9 +73,18 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                                     size_t max_components_per_phase,
                                     size_t *out_num_phases)
     {
+        ESP_LOGI(TAG, "Parsing cycle JSON (length: %zu bytes)...", strlen(json_str));
+        
         cJSON *root = cJSON_Parse(json_str);
+        
         if (!root) {
-            ESP_LOGE(TAG, "JSON parse error");
+            const char *error_ptr = cJSON_GetErrorPtr();
+            if (error_ptr && error_ptr >= json_str) {
+                size_t error_offset = error_ptr - json_str;
+                ESP_LOGE(TAG, "JSON parse error at offset %zu", error_offset);
+            } else {
+                ESP_LOGE(TAG, "JSON parse error");
+            }
             return ESP_FAIL;
         }
 
@@ -90,14 +105,10 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
             Phase *p = &phases[pi];
 
             cJSON *id        = cJSON_GetObjectItem(pjson, "id");
-            cJSON *name      = cJSON_GetObjectItem(pjson, "name");
-            cJSON *color     = cJSON_GetObjectItem(pjson, "color");
             cJSON *startTime = cJSON_GetObjectItem(pjson, "startTime");
             cJSON *components= cJSON_GetObjectItem(pjson, "components");
 
             p->id   = id   ? id->valuestring   : NULL;
-            p->name = name ? name->valuestring : NULL;
-            p->color= color? color->valuestring: NULL;
             p->start_time_ms = startTime ? (uint32_t)startTime->valueint : 0;
 
             size_t comp_count = cJSON_IsArray(components) ? cJSON_GetArraySize(components) : 0;
@@ -114,14 +125,12 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                 PhaseComponent *c = &phase_comps[ci];
 
                 cJSON *cid      = cJSON_GetObjectItem(cjson, "id");
-                cJSON *label    = cJSON_GetObjectItem(cjson, "label");
                 cJSON *start    = cJSON_GetObjectItem(cjson, "start");
                 cJSON *compId   = cJSON_GetObjectItem(cjson, "compId");
                 cJSON *duration = cJSON_GetObjectItem(cjson, "duration");
                 cJSON *motorCfg = cJSON_GetObjectItem(cjson, "motorConfig");
 
                 c->id          = cid      ? cid->valuestring      : NULL;
-                c->label       = label    ? label->valuestring    : NULL;
                 c->compId      = compId   ? compId->valuestring   : NULL;
                 c->start_ms    = start    ? (uint32_t)start->valueint    : 0;
                 c->duration_ms = duration ? (uint32_t)duration->valueint : 0;
@@ -139,19 +148,23 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                         cJSON *repeatTimes  = cJSON_GetObjectItem(motorCfg, "repeatTimes");
                         mc->repeat_times = repeatTimes ? repeatTimes->valueint : 1;
 
-                        // runningStyle (optional)
-                        cJSON *runningStyle = cJSON_GetObjectItem(motorCfg, "runningStyle");
-                        mc->running_style = runningStyle ? runningStyle->valuestring : NULL;
-
                         // pattern array
                         cJSON *pattern = cJSON_GetObjectItem(motorCfg, "pattern");
                         if (pattern && cJSON_IsArray(pattern)) {
                             int pattern_len = cJSON_GetArraySize(pattern);
                             if (pattern_len > 0) {
+                                ESP_LOGI(TAG, "Processing motor pattern with %d steps (repeat: %d), steps pool: %zu/%d", 
+                                        pattern_len, mc->repeat_times, g_motor_steps_used, MAX_MOTOR_STEPS);
+                                
+                                // Calculate total steps needed including repeats
+                                int total_steps_needed = pattern_len * mc->repeat_times;
+                                
                                 // remember where this motor's steps start in the global steps pool
                                 size_t steps_start = g_motor_steps_used;
                                 for (int si = 0; si < pattern_len; si++) {
                                     if (g_motor_steps_used >= MAX_MOTOR_STEPS) {
+                                        ESP_LOGE(TAG, "Motor steps pool exhausted! Used: %zu, Max: %d. Pattern truncated at step %d/%d", 
+                                                g_motor_steps_used, MAX_MOTOR_STEPS, si, pattern_len);
                                         break;
                                     }
                                     cJSON *step_json = cJSON_GetArrayItem(pattern, si);
@@ -169,6 +182,9 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                                 // now point the motor config to its slice of steps
                                 mc->pattern     = &g_motor_steps_pool[steps_start];
                                 mc->pattern_len = g_motor_steps_used - steps_start;
+                                
+                                ESP_LOGI(TAG, "Motor pattern stored: %zu steps from pool[%zu], total would be %d with repeats", 
+                                        mc->pattern_len, steps_start, total_steps_needed);
                             }
                         }
 
@@ -195,7 +211,7 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                     const char *type_str = type ? type->valuestring : "RPM";
                     if (strcmp(type_str, "RPM") == 0) {
                         st->type = SENSOR_TYPE_RPM;
-                    } else if (strcmp(type_str, "PRESSURE") == 0) {
+                    } else if (strcmp(type_str, "Pressure") == 0) {
                         st->type = SENSOR_TYPE_PRESSURE;
                     } else {
                         st->type = SENSOR_TYPE_UNKNOWN;
@@ -214,17 +230,18 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                     
                     p->sensor_trigger = st;
                     ESP_LOGI(TAG, "Phase '%s': sensor trigger configured (type=%d, threshold=%u, above=%d)",
-                             p->name, st->type, st->threshold, st->trigger_above);
+                             p->id ? p->id : "unknown", st->type, st->threshold, st->trigger_above);
                 } else {
-                    ESP_LOGW(TAG, "sensor_trigger pool full, ignoring trigger for phase '%s'", p->name);
+                    ESP_LOGW(TAG, "sensor_trigger pool full, ignoring trigger for phase '%s'", p->id ? p->id : "unknown");
                 }
             }
         }
 
         *out_num_phases = num_phases;
 
-        // NOTE: we didn't free root because we are borrowing strings
-        // for quick prototyping that's fine
+        // Store the JSON root globally so we can free it later when unloading
+        // The string pointers in structs are borrowed from this JSON tree
+        g_loaded_cycle_json = root;
 
         return ESP_OK;
     }
@@ -340,12 +357,18 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                                     size_t max_events)
     {
         size_t idx = 0;
+        size_t motor_events = 0;
+        size_t regular_events = 0;
+
+        ESP_LOGI(TAG, "Building timeline for phase '%s' with %zu components...", 
+                 phase->id ? phase->id : "unnamed", phase->num_components);
 
         for (size_t i = 0; i < phase->num_components && idx < max_events; i++) {
             const PhaseComponent *c = &phase->components[i];
 
             // motor branch
             if (c->has_motor && c->motor_cfg != NULL) {
+                size_t before_motor = idx;
                 size_t added = append_motor_events(
                     c,
                     phase->start_time_ms,
@@ -353,6 +376,9 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                     max_events - idx
                 );
                 idx += added;
+                motor_events += added;
+                ESP_LOGI(TAG, "  Motor component '%s': %zu events added", 
+                         c->compId ? c->compId : "unknown", added);
                 continue;
             }
 
@@ -386,7 +412,7 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
         }
 
         // Log the built timeline
-        ESP_LOGI(TAG, "=== Timeline for phase '%s' (%zu events) ===", phase->name, idx);
+        ESP_LOGI(TAG, "=== Timeline for phase '%s' (%zu events) ===", phase->id, idx);
         for (size_t i = 0; i < idx; i++) {
             const TimelineEvent *ev = &out_events[i];
             const char *event_type = (ev->type == EVENT_ON) ? "ON " : "OFF";
@@ -434,8 +460,113 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
         }
     }
 
+    // Called when a batch of timers completes to load the next batch
+    static void load_next_batch_timer_cb(void *arg)
+    {
+        // Current batch is done, delete its timers
+        for (size_t i = 0; i < BATCH_SIZE; i++) {
+            if (g_phase_ctx.timers[i]) {
+                esp_timer_stop(g_phase_ctx.timers[i]);
+                esp_timer_delete(g_phase_ctx.timers[i]);
+                g_phase_ctx.timers[i] = NULL;
+            }
+        }
+
+        // Move to next batch
+        g_phase_ctx.current_batch_idx++;
+        
+        // Check if we're done
+        if (g_phase_ctx.current_batch_idx >= g_phase_ctx.batches_total) {
+            // All batches complete
+            ESP_LOGI(TAG, "All batches loaded and executed");
+            return;
+        }
+
+        // Calculate events for this batch
+        size_t batch_start_idx = g_phase_ctx.current_batch_idx * BATCH_SIZE;
+        size_t batch_end_idx = (batch_start_idx + BATCH_SIZE < g_phase_ctx.num_events) ?
+                                batch_start_idx + BATCH_SIZE : g_phase_ctx.num_events;
+        size_t events_in_batch = batch_end_idx - batch_start_idx;
+
+        ESP_LOGI(TAG, "Loading batch %zu/%zu (%zu events)", 
+                 g_phase_ctx.current_batch_idx + 1, g_phase_ctx.batches_total, events_in_batch);
+
+        uint64_t now_us = esp_timer_get_time();
+        uint64_t batch_start_us = g_phase_ctx.batch_start_us;
+
+        // Create timers for this batch
+        // Note: Events have absolute fire_time_us from phase start
+        // We need to schedule them relative to NOW, not from batch_start_us
+        for (size_t i = 0; i < events_in_batch; i++) {
+            const TimelineEvent *ev = &g_phase_ctx.events[batch_start_idx + i];
+
+            const esp_timer_create_args_t args = {
+                .callback = event_timer_cb,
+                .arg = (void *)ev,
+                .name = "cycle_evt"
+            };
+
+            esp_timer_handle_t tmr;
+            esp_err_t err = esp_timer_create(&args, &tmr);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "esp_timer_create failed for batch event: %s", esp_err_to_name(err));
+                continue;
+            }
+
+            // Compute delay: event's absolute time minus how much time has passed since phase start
+            uint64_t time_since_phase_start = now_us - batch_start_us;
+            uint64_t delay_us;
+            if (ev->fire_time_us > time_since_phase_start) {
+                delay_us = ev->fire_time_us - time_since_phase_start;
+            } else {
+                delay_us = 1000; // late: fire asap (within 1ms)
+            }
+
+            esp_timer_start_once(tmr, delay_us);
+            g_phase_ctx.timers[i] = tmr;
+        }
+
+        // Find when the last event of this batch fires to know when to load next batch
+        if (events_in_batch > 0) {
+            uint64_t last_event_time_us = g_phase_ctx.events[batch_end_idx - 1].fire_time_us;
+            uint64_t time_since_phase_start = now_us - batch_start_us;
+            
+            // Calculate delay to next batch: when does the last event fire, plus 1ms buffer
+            uint64_t delay_to_next_batch;
+            if (last_event_time_us > time_since_phase_start) {
+                // Events in this batch haven't fired yet; schedule batch loader after them
+                delay_to_next_batch = (last_event_time_us - time_since_phase_start) + 1000;
+            } else {
+                // Last event already passed (shouldn't happen, but be safe)
+                delay_to_next_batch = 1000;
+            }
+
+            if (g_phase_ctx.batch_timer) {
+                esp_timer_stop(g_phase_ctx.batch_timer);
+                esp_timer_delete(g_phase_ctx.batch_timer);
+            }
+
+            // Create timer to fire after last event to trigger next batch load
+            const esp_timer_create_args_t batch_args = {
+                .callback = load_next_batch_timer_cb,
+                .arg = NULL,
+                .name = "batch_load"
+            };
+
+            esp_err_t err = esp_timer_create(&batch_args, &g_phase_ctx.batch_timer);
+            if (err == ESP_OK) {
+                esp_timer_start_once(g_phase_ctx.batch_timer, delay_to_next_batch);
+                ESP_LOGI(TAG, "Batch timer set for %.3f seconds", delay_to_next_batch / 1000000.0);
+            } else {
+                ESP_LOGE(TAG, "Failed to create batch timer: %s", esp_err_to_name(err));
+            }
+        }
+    }
+
     // ------------------------------------------------------------
-    // PUBLIC: run one phase with esp_timers, but keep handles
+    // PUBLIC: run one phase with esp_timers using batching
+    // For large event counts (up to 1600), load events in batches of 200
+    // to avoid heap exhaustion from creating too many timer handles at once
     // ------------------------------------------------------------
     void run_phase_with_esp_timer(const Phase *phase)
     {
@@ -444,7 +575,7 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
         g_phase_ctx.active = true;
 
         //set current phase name
-        current_phase_name = phase->name ? phase->name : "Unknown"; 
+        current_phase_name = phase->id ? phase->id : "Unknown"; 
         
         
         // build timeline into context
@@ -456,9 +587,25 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
 
         uint64_t base_us = esp_timer_get_time();
         phase_start_us = base_us;   // so monitor prints from this phase start
+        g_phase_ctx.batch_start_us = base_us;
 
-        for (size_t i = 0; i < n; i++) {
-            const TimelineEvent *ev = &g_phase_ctx.events[i];
+        // Calculate number of batches needed
+        g_phase_ctx.batches_total = (n + BATCH_SIZE - 1) / BATCH_SIZE;
+        g_phase_ctx.current_batch_idx = 0;
+
+        ESP_LOGI(TAG, "Phase '%s': %zu events in %zu batches (batch_size=%u)", 
+                 phase->id, n, g_phase_ctx.batches_total, BATCH_SIZE);
+
+        // Load first batch
+        size_t batch_start_idx = 0;
+        size_t batch_end_idx = (BATCH_SIZE < n) ? BATCH_SIZE : n;
+        size_t events_in_batch = batch_end_idx - batch_start_idx;
+
+        ESP_LOGI(TAG, "Loading batch 1/%zu (%zu events)", g_phase_ctx.batches_total, events_in_batch);
+
+        // Create timers for first batch
+        for (size_t i = 0; i < events_in_batch; i++) {
+            const TimelineEvent *ev = &g_phase_ctx.events[batch_start_idx + i];
 
             // create timer
             const esp_timer_create_args_t args = {
@@ -491,7 +638,27 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
             g_phase_ctx.timers[i] = tmr;
         }
 
-        ESP_LOGI(TAG, "Scheduled %zu events for phase %s", n, phase->name);
+        // If there are more batches, set up batch timer for next load
+        if (g_phase_ctx.batches_total > 1) {
+            uint64_t last_event_time_us = g_phase_ctx.events[batch_end_idx - 1].fire_time_us;
+            uint64_t delay_to_next_batch = last_event_time_us + 1000; // 1ms after last event
+
+            const esp_timer_create_args_t batch_args = {
+                .callback = load_next_batch_timer_cb,
+                .arg = NULL,
+                .name = "batch_load"
+            };
+
+            esp_err_t err = esp_timer_create(&batch_args, &g_phase_ctx.batch_timer);
+            if (err == ESP_OK) {
+                esp_timer_start_once(g_phase_ctx.batch_timer, delay_to_next_batch);
+                ESP_LOGI(TAG, "Batch loader timer scheduled for %.3f seconds", delay_to_next_batch / 1000000.0);
+            } else {
+                ESP_LOGE(TAG, "Failed to create batch timer: %s", esp_err_to_name(err));
+            }
+        }
+
+        ESP_LOGI(TAG, "Scheduled %zu events for phase %s in batches", n, phase->id);
     }
 
     // ------------------------------------------------------------
@@ -509,13 +676,20 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
             return;
         }
 
-        // stop all pending timers
-        for (size_t i = 0; i < g_phase_ctx.num_events; i++) {
+        // stop all pending timers in current batch
+        for (size_t i = 0; i < BATCH_SIZE; i++) {
             if (g_phase_ctx.timers[i]) {
                 esp_timer_stop(g_phase_ctx.timers[i]);
                 esp_timer_delete(g_phase_ctx.timers[i]);
                 g_phase_ctx.timers[i] = NULL;
             }
+        }
+
+        // stop batch loader timer if it exists
+        if (g_phase_ctx.batch_timer) {
+            esp_timer_stop(g_phase_ctx.batch_timer);
+            esp_timer_delete(g_phase_ctx.batch_timer);
+            g_phase_ctx.batch_timer = NULL;
         }
 
         if (force_off_all) {
@@ -562,6 +736,9 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
     {
         cycle_running = true;
         target_phase_index = -1;
+        
+        size_t heap_at_start = esp_get_free_heap_size();
+        ESP_LOGI(TAG, "=== CYCLE START: Free heap = %zu bytes ===", heap_at_start);
 
         for (size_t i = 0; i < num_phases; i++) {
             // Check if we should stop the entire cycle
@@ -582,25 +759,78 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
                 target_phase_index = -1;
                 continue;
             }
+            
+            // Log heap before each phase
+            size_t heap_before_phase = esp_get_free_heap_size();
+            ESP_LOGI(TAG, "Phase %zu start - Free heap: %zu bytes (delta: %ld)", 
+                     i+1, heap_before_phase, (long)heap_before_phase - (long)heap_at_start);
 
             current_phase_index = (int)i + 1;  // update current phase index for telemetry
             Phase *p = &phases[i];
 
-            ESP_LOGI(TAG, "=== Running phase %d: %s ===", (int)i + 1, p->name);
+            ESP_LOGI(TAG, "=== Running phase %d: %s ===", (int)i + 1, p->id);
             run_phase_with_esp_timer(p);
 
             while (g_phase_ctx.active) {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
+
+            // Ensure all timers from this phase are cleaned up before moving to next
+            // Clean up current batch timers
+            for (size_t j = 0; j < BATCH_SIZE; j++) {
+                if (g_phase_ctx.timers[j]) {
+                    esp_timer_stop(g_phase_ctx.timers[j]);
+                    esp_timer_delete(g_phase_ctx.timers[j]);
+                    g_phase_ctx.timers[j] = NULL;
+                }
+            }
+            
+            // Clean up batch loader timer
+            if (g_phase_ctx.batch_timer) {
+                esp_timer_stop(g_phase_ctx.batch_timer);
+                esp_timer_delete(g_phase_ctx.batch_timer);
+                g_phase_ctx.batch_timer = NULL;
+            }
+            
+            // Small delay to allow other tasks to run
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
 
-        ESP_LOGI(TAG, "=== Cycle completed ===");
+        size_t heap_at_end = esp_get_free_heap_size();
+        ESP_LOGI(TAG, "=== CYCLE COMPLETED - Free heap: %zu bytes (delta: %ld) ===", 
+                 heap_at_end, (long)heap_at_end - (long)heap_at_start);
 
         cycle_running = false;
         current_phase_index = 0;
     }
 
+    // Free memory from previously loaded cycle
+    void cycle_unload(void)
+    {
+        ESP_LOGI(TAG, "Unloading previous cycle...");
 
+        // Free the JSON tree if we have one
+        if (g_loaded_cycle_json) {
+            cJSON_Delete(g_loaded_cycle_json);
+            g_loaded_cycle_json = NULL;
+            ESP_LOGI(TAG, "Previous cycle JSON freed");
+        }
+
+        // Reset pools and counts
+        g_motor_cfg_used = 0;
+        g_motor_steps_used = 0;
+        g_sensor_trigger_used = 0;
+        g_num_phases = 0;
+        
+        // Clear static arrays
+        memset(g_phases, 0, sizeof(g_phases));
+        memset(g_components_pool, 0, sizeof(g_components_pool));
+        memset(g_sensor_trigger_pool, 0, sizeof(g_sensor_trigger_pool));
+        memset(g_motor_cfg_pool, 0, sizeof(g_motor_cfg_pool));
+        memset(g_motor_steps_pool, 0, sizeof(g_motor_steps_pool));
+
+        ESP_LOGI(TAG, "Cycle unloaded, memory freed");
+    }
 
     esp_err_t cycle_load_from_json_str(const char *json_str)
     {
@@ -609,14 +839,12 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
             return ESP_FAIL;
         }
 
-        // reset motor pools, sensor trigger pool, and phase count
-        g_motor_cfg_used = 0;
-        g_motor_steps_used = 0;
-        g_sensor_trigger_used = 0;
-        g_num_phases = 0;
-        memset(g_phases, 0, sizeof(g_phases));
-        memset(g_components_pool, 0, sizeof(g_components_pool));
-        memset(g_sensor_trigger_pool, 0, sizeof(g_sensor_trigger_pool));
+        ESP_LOGI(TAG, "Starting cycle load from JSON...");
+
+        // Free any previously loaded cycle
+        cycle_unload();
+
+        ESP_LOGI(TAG, "Pools reset. MAX_MOTOR_STEPS=%d, MAX_PHASES=%d", MAX_MOTOR_STEPS, MAX_PHASES);
 
         // Use existing parser
         esp_err_t ret = load_cycle_from_json_str(
@@ -629,9 +857,13 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
         );
 
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Loaded %zu phases into RAM (IDLE)", g_num_phases);
+            ESP_LOGI(TAG, "Loaded %zu phases into RAM. Motor configs used: %zu, Motor steps used: %zu/%d", 
+                    g_num_phases, g_motor_cfg_used, g_motor_steps_used, MAX_MOTOR_STEPS);
+            // Update WebSocket cycle_data cache with the newly loaded cycle
+            ws_update_cycle_data_cache();
         } else {
-            ESP_LOGE(TAG, "Failed to load cycle from JSON");
+            ESP_LOGE(TAG, "Failed to load cycle from JSON. Motor configs used: %zu, Motor steps used: %zu/%d", 
+                    g_motor_cfg_used, g_motor_steps_used, MAX_MOTOR_STEPS);
         }
 
         return ret;
@@ -653,6 +885,12 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
         }
 
         ESP_LOGI(TAG, "Running loaded cycle (%zu phases) in background task", g_num_phases);
+        
+        // Reset sensors before starting new cycle for clean data
+        ESP_LOGI(TAG, "Resetting sensors before starting cycle...");
+        rpm_sensor_reset();
+        pressure_sensor_reset();
+        ESP_LOGI(TAG, "Sensors reset complete");
         
         // Create a background task to run the cycle so WebSocket stays responsive
         xTaskCreatePinnedToCore(

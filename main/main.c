@@ -4,6 +4,7 @@
 #include "esp_log.h"
 
 
+
 #include "cycle.h"
 #include "fs.h"
 #include "wifi_sta.h"
@@ -55,6 +56,8 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "=== CycleOptima ESP V4 ===");
 
+   
+
     // 1) hardware ready
     init_all_gpio();
 
@@ -66,7 +69,7 @@ void app_main(void)
     
 
     // 4) start telemetry system (gathers GPIO, sensors, cycle info)
-    telemetry_init(100);  // update every 100ms
+    telemetry_init(1000);  // update every 1000ms (increased from 100ms to reduce heap fragmentation)
 
     // 4b) register telemetry callback for WebSocket broadcast (will be activated after ws_cycle_start)
     ws_register_telemetry_callback();
@@ -102,6 +105,7 @@ void app_main(void)
         NULL
     );
 
+   
     // 8) main loop just idles; control comes from websocket
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
