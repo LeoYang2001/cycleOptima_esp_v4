@@ -86,78 +86,8 @@ static void gather_cycle_telemetry(CycleTelemetry *cycle_tel)
     cycle_tel->timestamp_ms = elapsed_us / 1000;
 }
 
-/**
- * Check if current phase has a sensor trigger and if it should fire
- * Returns true if trigger fires and cycle should skip to next phase
- */
-static bool check_sensor_trigger(const SensorTelemetry *sensor_data)
-{
-    if (!cycle_running || current_phase_index <= 0 || current_phase_index > (int)g_num_phases) {
-        return false;
-    }
-
-    // Get current phase (note: current_phase_index is 1-based for display)
-    int phase_idx = current_phase_index - 1;
-    if (phase_idx < 0 || phase_idx >= (int)g_num_phases) {
-        return false;
-    }
-
-    Phase *phase = &g_phases[phase_idx];
-    if (!phase->sensor_trigger) {
-        return false;  // No trigger for this phase
-    }
-
-    SensorTrigger *trigger = phase->sensor_trigger;
-    
-    // If already triggered in this phase, don't trigger again
-    if (trigger->has_triggered) {
-        return false;
-    }
-
-    bool should_trigger = false;
-    uint32_t sensor_value = 0;
-    
-    // Check which sensor type and get value
-    if (trigger->type == SENSOR_TYPE_RPM) {
-        sensor_value = (uint32_t)sensor_data->rpm;
-        
-        // Check threshold
-        if (trigger->trigger_above) {
-            should_trigger = (sensor_value > trigger->threshold);
-        } else {
-            should_trigger = (sensor_value < trigger->threshold);
-        }
-        
-        if (should_trigger) {
-            ESP_LOGI(TAG, "Sensor trigger FIRED: RPM=%u %s threshold=%u",
-                     sensor_value,
-                     trigger->trigger_above ? ">" : "<",
-                     trigger->threshold);
-        }
-    } else if (trigger->type == SENSOR_TYPE_PRESSURE) {
-        sensor_value = (uint32_t)sensor_data->pressure_freq;
-        
-        // Check threshold
-        if (trigger->trigger_above) {
-            should_trigger = (sensor_value > trigger->threshold);
-        } else {
-            should_trigger = (sensor_value < trigger->threshold);
-        }
-        
-        if (should_trigger) {
-            ESP_LOGI(TAG, "Sensor trigger FIRED: Pressure=%u %s threshold=%u",
-                     sensor_value,
-                     trigger->trigger_above ? ">" : "<",
-                     trigger->threshold);
-        }
-    }
-    
-    if (should_trigger) {
-        trigger->has_triggered = true;  // Mark as triggered
-    }
-    
-    return should_trigger;
-}
+// NOTE: Sensor trigger logic has been moved to cycle.c (check_phase_sensor_trigger)
+// This keeps cycle control logic in the cycle task, making it independent of telemetry
 
 // ====================== BACKGROUND TASK ======================
 
@@ -178,10 +108,8 @@ static void telemetry_task(void *pvParameter)
         gather_sensor_telemetry(&packet.sensors);
         gather_cycle_telemetry(&packet.cycle);
 
-        // Check for sensor trigger (skip phase if threshold met)
-        if (check_sensor_trigger(&packet.sensors)) {
-            cycle_skip_current_phase(true);
-        }
+        // NOTE: Sensor trigger logic has been moved to cycle.c for robustness
+        // Telemetry now only gathers and reports data, cycle task handles control logic
 
         // Update the latest snapshot (thread-safe)
         if (xSemaphoreTake(telemetry_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -208,8 +136,9 @@ static void telemetry_task(void *pvParameter)
                    packet.sensors.pressure_freq);
         }
 
-        // Wait for next update interval
+        // Wait for next update interval, yielding to allow other tasks (especially IDLE watchdog)
         vTaskDelay(pdMS_TO_TICKS(g_update_interval_ms));
+        taskYIELD();  // Explicitly yield to prevent starving IDLE task
     }
 
     ESP_LOGI(TAG, "Telemetry task stopped");

@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "driver/gpio.h"
+#include "cJSON.h"
 
 // ------------------------- PIN MAPPINGS -------------------------
 #define RETRACTOR_PIN        GPIO_NUM_7
@@ -31,7 +32,7 @@
 #define MAX_SENSOR_TRIGGERS       MAX_PHASES  // One sensor trigger per phase maximum
 
 // Timeline execution limits
-#define MAX_EVENTS_PER_PHASE      3200  // Reduced from 1024 - should handle largest motor patterns
+#define MAX_EVENTS_PER_PHASE      3400  // Reduced from 1024 - should handle largest motor patterns
 
 // -------------------- MOTOR TYPES --------------------
 // one entry in "pattern": { stepTime, pauseTime, direction }
@@ -100,6 +101,11 @@ esp_err_t load_cycle_from_json_str(const char *json_str,
                                    PhaseComponent *components_pool,
                                    size_t max_components_per_phase,
                                    size_t *out_num_phases);
+
+// Load cycle directly from already-parsed cJSON tree (optimized for WebSocket uploads)
+// Takes the full root object (not just "data") so we can store it and keep string pointers alive
+// The root will be freed when cycle_unload() is called
+esp_err_t load_cycle_from_cjson(cJSON *root_json);
 
 // -------------------- GLOBAL STATE (accessible to WebSocket/telemetry) --------------------
 extern Phase g_phases[MAX_PHASES];  // All loaded phases

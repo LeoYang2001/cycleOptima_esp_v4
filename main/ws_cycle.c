@@ -190,91 +190,72 @@ esp_err_t ws_handler(httpd_req_t *req)
         cJSON *data = cJSON_GetObjectItem(root, "data");
         if (!data) {
             ws_send_text(req, "error: missing data for write_json");
-        } else {
-            // Stop current cycle if running
-            cycle_skip_current_phase(true);
-
-            // Check available heap memory before processing
-            size_t free_heap = esp_get_free_heap_size();
-            ESP_LOGI(TAG, "Free heap before processing: %zu bytes", free_heap);
-
-            // The data should be an object with a "phases" field
-            // Validate it has the structure we expect
-            if (!cJSON_IsObject(data)) {
-                ws_send_text(req, "error: data field must be an object");
-                cJSON_Delete(root);
-                free(buf);
-                return ESP_OK;
-            }
-            
-            cJSON *phases = cJSON_GetObjectItem(data, "phases");
-            if (!phases || !cJSON_IsArray(phases)) {
-                ws_send_text(req, "error: data.phases must be an array");
-                cJSON_Delete(root);
-                free(buf);
-                return ESP_OK;
-            }
-
-            // SIMPLER APPROACH: Serialize directly to SPIFFS file
-            // Use unformatted JSON to save memory and time
-            ESP_LOGI(TAG, "Serializing cycle data directly to SPIFFS...");
-            
-            char *json_str = cJSON_PrintUnformatted(data);  // Compact, no extra whitespace
-            if (!json_str) {
-                ESP_LOGE(TAG, "Failed to serialize cycle data");
-                ws_send_text(req, "error: failed to serialize cycle data");
-                cJSON_Delete(root);
-                free(buf);
-                return ESP_FAIL;    
-            }
-            
-            size_t json_len = strlen(json_str);
-            ESP_LOGI(TAG, "Serialized cycle JSON: %zu bytes", json_len);
-
-            // Write directly to SPIFFS
-            ESP_LOGI(TAG, "Writing to SPIFFS...");
-            if (fs_write_file("/spiffs/cycle.json", json_str, json_len) == ESP_OK) {
-                ESP_LOGI(TAG, "cycle.json saved via websocket (%zu bytes)", json_len);
-            } else {
-                ESP_LOGE(TAG, "failed to write cycle.json to SPIFFS");
-                free(json_str);
-                cJSON_Delete(root);
-                free(buf);
-                return ESP_FAIL;
-            }
-
-            // Free the serialized JSON
-            free(json_str);
-            
-            // Now read from SPIFFS and load into RAM
-            // This gives us a fresh copy without any earlier parsing artifacts
-            ESP_LOGI(TAG, "Reading cycle.json from SPIFFS for parsing...");
-            char *spiffs_json = fs_read_file("/spiffs/cycle.json");
-            if (!spiffs_json) {
-                ESP_LOGE(TAG, "Failed to read cycle.json from SPIFFS");
-                cJSON_Delete(root);
-                free(buf);
-                return ESP_FAIL;
-            }
-
-            // Check memory before cycle loading
-            size_t free_heap_before_load = esp_get_free_heap_size();
-            ESP_LOGI(TAG, "Free heap before cycle load: %zu bytes", free_heap_before_load);
-
-            // Load into RAM using the SPIFFS data
-            ESP_LOGI(TAG, "Loading cycle into RAM...");
-            esp_err_t load_result = cycle_load_from_json_str(spiffs_json);
-            if (load_result == ESP_OK) {
-                ESP_LOGI(TAG, "Cycle loaded successfully");
-                ws_send_text(req, "ok: json written and loaded");
-            } else {
-                ESP_LOGE(TAG, "Cycle load failed with error: %d", load_result);
-                ws_send_text(req, "error: json written but failed to load");
-            }
-
-            // Free the SPIFFS buffer
-            free(spiffs_json);
+            cJSON_Delete(root);
+            free(buf);
+            return ESP_OK;
         }
+
+        // Stop current cycle if running
+        cycle_skip_current_phase(true);
+
+        // Check available heap memory before processing
+        size_t free_heap = esp_get_free_heap_size();
+        ESP_LOGI(TAG, "Free heap before processing: %zu bytes", free_heap);
+
+        // The data should be an object with a "phases" field
+        if (!cJSON_IsObject(data)) {
+            ws_send_text(req, "error: data field must be an object");
+            cJSON_Delete(root);
+            free(buf);
+            return ESP_OK;
+        }
+        
+        cJSON *phases = cJSON_GetObjectItem(data, "phases");
+        if (!phases || !cJSON_IsArray(phases)) {
+            ws_send_text(req, "error: data.phases must be an array");
+            cJSON_Delete(root);
+            free(buf);
+            return ESP_OK;
+        }
+
+        // ===== OPTIMIZED PATH: Load directly from cJSON tree =====
+        // Skip serialization and re-parsing. This avoids heap fragmentation.
+        // Pass the data object (which contains "phases") so cycle.c can store it
+        // and keep string pointers alive for the lifetime of the cycle.
+        ESP_LOGI(TAG, "Loading cycle directly from parsed JSON tree (optimized)...");
+        esp_err_t load_result = load_cycle_from_cjson(data);
+
+        if (load_result == ESP_OK) {
+            ESP_LOGI(TAG, "Cycle loaded successfully from cJSON tree");
+            
+            // OPTIONAL: Also write to SPIFFS for persistence/backup
+            // This is now a lower-priority operation and doesn't block the load
+            ESP_LOGI(TAG, "Writing cycle to SPIFFS for persistence...");
+            
+            // Try to serialize and write, but don't fail if it doesn't work
+            char *json_str = cJSON_PrintUnformatted(data);
+            if (json_str) {
+                size_t json_len = strlen(json_str);
+                if (fs_write_file("/spiffs/cycle.json", json_str, json_len) == ESP_OK) {
+                    ESP_LOGI(TAG, "cycle.json saved to SPIFFS (%zu bytes) for backup", json_len);
+                } else {
+                    ESP_LOGW(TAG, "Failed to write to SPIFFS (non-fatal, cycle already loaded)");
+                }
+                free(json_str);
+            } else {
+                ESP_LOGW(TAG, "Could not serialize for SPIFFS backup (non-fatal, cycle already loaded)");
+            }
+
+            ws_send_text(req, "ok: cycle loaded");
+        } else {
+            ESP_LOGE(TAG, "Cycle load failed with error: %d", load_result);
+            ws_send_text(req, "error: failed to load cycle");
+        }
+
+        // NOTE: Do NOT free the root here! cycle.c has stored the data object in g_loaded_cycle_json
+        // It will be freed when cycle_unload() is called (e.g., when a new cycle loads)
+        free(buf);
+        return ESP_OK;
     }
     // ========== COMMAND: start_cycle ==========
     else if (strcmp(action->valuestring, "start_cycle") == 0) {

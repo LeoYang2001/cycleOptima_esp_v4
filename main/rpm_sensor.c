@@ -142,7 +142,8 @@ float rpm_sensor_get_rpm(void)
 
     uint64_t now_us = esp_timer_get_time();
 
-    // timeout: no pulse for RPM_TIMEOUT_MS
+    // timeout: no pulse for RPM_TIMEOUT_MS -> return 0
+    // Motor may be OFF, stalled, or coasting without pulses
     if ((now_us - ts_local[idx_local]) > (RPM_TIMEOUT_MS * 1000ULL)) {
         return 0.0f;
     }
@@ -200,7 +201,13 @@ float rpm_sensor_get_rpm(void)
     if (rpm < 0.0f) rpm = 0.0f;
 
     // Apply acceleration limiting to prevent unrealistic jumps
-    float limited_rpm = apply_acceleration_limit(rpm, s_last_avg_rpm);
+    // BUT: skip limiter if transitioning from 0 (motor just turned on)
+    float limited_rpm = rpm;
+    if (s_last_avg_rpm > 0.0f && rpm > 0.0f) {
+        // Both previous and current are non-zero: apply limiter to smooth noise
+        limited_rpm = apply_acceleration_limit(rpm, s_last_avg_rpm);
+    }
+    // If last was 0 and now non-zero, or last non-zero and now 0, use raw value
     
     // Update the last RPM reading for next comparison
     s_last_avg_rpm = limited_rpm;
