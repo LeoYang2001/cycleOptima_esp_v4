@@ -543,7 +543,6 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
     {
         size_t idx = 0;
         size_t motor_events = 0;
-        size_t regular_events = 0;
 
         ESP_LOGI(TAG, "Building timeline for phase '%s' with %zu components...", 
                  phase->id ? phase->id : "unnamed", phase->num_components);
@@ -553,7 +552,6 @@ size_t g_num_phases = 0;  // non-static for telemetry access    // -------------
 
             // motor branch
             if (c->has_motor && c->motor_cfg != NULL) {
-                size_t before_motor = idx;
                 size_t added = append_motor_events(
                     c,
                     phase->start_time_ms,

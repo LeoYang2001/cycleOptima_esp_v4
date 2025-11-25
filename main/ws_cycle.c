@@ -60,44 +60,6 @@ void ws_broadcast_text(const char *msg)
     }
 }
 
-// Task to process large JSON in a separate context with more stack space
-static void json_processing_task(void *pvParameters)
-{
-    json_task_params_t *params = (json_task_params_t *)pvParameters;
-    
-    ESP_LOGI(TAG, "JSON processing task started with %zu byte JSON", params->json_length);
-    
-    // Check available heap in this task
-    size_t free_heap = esp_get_free_heap_size();
-    ESP_LOGI(TAG, "Free heap in processing task: %zu bytes", free_heap);
-    
-    // Write to SPIFFS first
-    ESP_LOGI(TAG, "Writing to SPIFFS...");
-    if (fs_write_file("/spiffs/cycle.json", params->json_data, params->json_length) == ESP_OK) {
-        ESP_LOGI(TAG, "cycle.json updated via websocket (%zu bytes)", params->json_length);
-    } else {
-        ESP_LOGE(TAG, "failed to write cycle.json to spiffs");
-        params->success = false;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // Load into RAM using extracted cycle JSON string
-    ESP_LOGI(TAG, "Loading cycle into RAM...");
-    esp_err_t load_result = cycle_load_from_json_str(params->json_data);
-    if (load_result == ESP_OK) {
-        ESP_LOGI(TAG, "Cycle loaded successfully");
-        params->success = true;
-    } else {
-        ESP_LOGE(TAG, "Cycle load failed with error: %d", load_result);
-        params->success = false;
-    }
-    
-    // Task will be cleaned up by caller
-    vTaskDelete(NULL);
-}
-
-
 // optional: helper to send a small text reply
 static void ws_send_text(httpd_req_t *req, const char *msg)
 {
